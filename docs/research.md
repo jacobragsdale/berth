@@ -60,11 +60,11 @@ The [OpenGitOps v1.0 principles](https://opengitops.dev/) are declarative state,
 | Review the rendered output as well as the parameters | Meta, Akuity | `rendered/` committed and checked |
 | Owners listed as individuals per directory | Google OWNERS | `owners:` in `app.yaml`, judged from the target branch |
 | Approval by rule and risk; humans only where needed | Google, Meta RADAR, Uber | `platform/review.yaml`, `review.py` |
-| Admission control as the real enforcement | Spotify, Airbnb | `platform/admission/` |
+| Admission control as the real enforcement | Spotify, Airbnb | built-in ValidatingAdmissionPolicies, rendered by `render/admission.py` |
 | A version reaches prod only after the previous stage | Monzo, Netflix `depends-on` | promotion escalation from git history |
 | Checks that delay rather than reject | Google Annealing, Uber windows | `freezes` |
-| Breakglass that is fast and audited | Google BSRS | `break-glass` label (alerting not built) |
-| No deletion by absence | Google Prodspec | `prune: disabled` on namespaces and volumes |
+| Breakglass that is fast and audited | Google BSRS | `berth breakglass` marks, the `break-glass` label, and the daily drift report |
+| No deletion by absence | Google Prodspec | prune only with `--prune`, never namespaces or volumes |
 | Shared changes reported to the services they reach | Meta AutoCanary | "rendered output changes without a spec change" |
 | One source rendering two schedulers | Stripe | `orchestrator: airflow` or `controlm` |
 | Curated menus plus a counted escape hatch | Meta Twine, SRE Workbook | `sizes`, `overrides` with a required reason |

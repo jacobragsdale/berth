@@ -1,137 +1,294 @@
-# Design: one spec per app, review by risk
+# Design: one spec per app, review by risk, deploys you can see
 
-berth replaces "one person reviews every deployment change" with three parts. Each app has a small spec that only says what its owners know. A renderer turns that spec into everything the platform knows. Rules decide how much review each change needs. The platform team keeps central control by owning the spec format, the renderer, the rules and the admission policies, rather than by reading 400 apps' diffs. Delivery is GitOps: Flux pulls the rendered output from git and keeps the clusters matching it.
+berth replaces "one person reviews every deployment change" with three parts. Each app has a small spec that only says what its owners know. A renderer turns that spec into everything the platform knows. Rules decide how much review each change needs. The platform team keeps central control by owning the spec format, the renderer, the rules and the admission policies, rather than by reading 400 apps' diffs.
+
+Delivery is deliberately plain. A pipeline applies the rendered output with `kubectl` after each merge, and a daily report says where the clusters differ from git. There is no controller in the cluster, and no tool to learn beyond kubectl and Python.
 
 ## The problem is review attention
 
-The setup this replaces keeps every Deployment, ConfigMap, git-crypt secret, resource request and mount for about 400 deployments in one repository, and the infra lead approves every change. That repository already is declarative and versioned, so it has most of what GitOps asks for. What does not scale is the reviewer. Meta's configuration paper calls this arrangement the "conservative extreme": "a central committee for approval" ([Tang et al., SOSP 2015](https://sigops.org/s/conferences/sosp/2015/current/2015-Monterey/printable/008-tang.pdf)).
+The setup this replaces keeps every Deployment, ConfigMap, git-crypt secret, resource request and mount for about 400 deployments in one repository. That repository is a mix of Helm charts, plain YAML and bash scripts, and the infra lead approves every change. Changes are applied with kubectl from someone's laptop. No pipeline runs, so nothing proves that what runs matches the repository, and nothing keeps image tags in step across environments.
 
-Most of the review load is changes that a platform reviewer cannot judge anyway. An image tag bump, a timeout value or a log level is the owning developer's call, and the infra lead can only check that it parses. The changes that need infra judgment are rare: a new mount, an identity that reaches Azure resources, a public hostname, a 4 GiB pod, an override of the pod spec. A single queue spends the same attention on both kinds, so it is slow for the common case and not especially careful for the rare one.
+Other teams own some of the surroundings:
+
+- Clusters and node pools belong to a separate cloud engineering team that works in Terraform. Node pools already autoscale.
+- Apps send OpenTelemetry to Datadog.
+- Airflow is run by the same team as the repository; Control-M is run by another team.
+- Every batch job, on either scheduler, runs in a container declared in the repository.
+- Other systems on the company network call some services by URL, under a subdomain scheme the company already has.
+- Outbound traffic goes through a corporate proxy.
+
+Most of the review load is changes that a platform reviewer cannot judge anyway. An image tag bump, a timeout value or a log level is the owning developer's call, and the infra lead can only check that it parses. The changes that need infra judgment are rare: a new mount, an identity that reaches Azure resources, a 4 GiB pod, an override of the pod spec, an app's first deploy to production. A single queue spends the same attention on both kinds, so it is slow for the common case and not especially careful for the rare one. Meta's configuration paper calls this arrangement the "conservative extreme": "a central committee for approval" ([Tang et al., SOSP 2015](https://sigops.org/s/conferences/sosp/2015/current/2015-Monterey/printable/008-tang.pdf)).
 
 ## What the system has to do
 
 Working back from that problem, any replacement has to keep these properties:
 
-1. Everything running in a cluster traces back to a reviewed commit, so audit, rollback and rebuilding a cluster all start from git.
+1. Everything running in a cluster traces back to a reviewed commit, and anything that does not is found within a day.
 2. Owners state intent and the platform decides mechanism. The smaller the interface, the less there is to review and the less there is to misuse.
 3. Review effort follows risk, decided by written rules rather than by one person reading everything.
 4. Guardrails sit in more than one layer: what the spec cannot express, what CI rejects, and what the API server refuses.
-5. Ownership attaches to the thing that deploys.
+5. Ownership attaches to the thing that deploys, and developers are trusted with as much as that allows.
 6. Promotion moves the same artifact forward, and production only receives what already ran in qa.
 7. One app's mistake can neither block nor break another app.
 8. A fleet-wide change is cheap to make and its blast radius is visible before it merges.
 9. Nothing that holds data is deleted because a file went missing.
-10. An emergency has a fast path that is still audited.
-
-The rest of this page is how berth meets each of these, and where it does not yet.
-
-## Is this GitOps?
-
-GitOps is a practice, and the question of whether berth uses it is fair. The [OpenGitOps v1.0 principles](https://opengitops.dev/) say a system's desired state is declarative, versioned and immutable, pulled automatically by software agents, and continuously reconciled. Those principles describe how desired state reaches the cluster. On who may change that state they say only that the store "should provide access control and auditing on the changes" ([glossary](https://github.com/open-gitops/documents/blob/main/GLOSSARY.md)).
-
-So GitOps is the right delivery model, and berth uses it: Flux pulls `rendered/` from git and reconciles each cluster to it. But adopting Flux or Argo CD would not fix the bottleneck by itself, because the bottleneck is in the half GitOps leaves open: what people write, and who must approve it. berth adds that half, which is the spec, the renderer and the gate.
+10. An emergency has a fast path that is still recorded and reconciled afterwards.
+11. Day-to-day changes, including a new app, never wait on cloud engineering. Whatever does need them is a one-time setup.
+12. A new developer can learn what an app is, and what a change to it will do, from the repository alone.
+13. As few third-party moving parts as possible. Where the team can own something in Python, it does.
 
 ## The spec is the interface
 
-In berth, an app is one container image and everything that runs from it: its services, its scheduled workflows, and the configuration and secrets they share. An app has one version per environment, so promotion is a single value. A repository that builds two images becomes two apps. That rule keeps the unit of deployment, the unit of promotion and the unit of ownership the same thing.
+In berth, an app is one container image and everything that runs from it: its services, its scheduled workflows, and the configuration and secrets they share. An app has one version per environment, so promotion is a single value. A repository that builds two images becomes two apps. Third-party software that only runs a container, such as Redis or a vendor's web app, is an app like any other. Its image is copied into ACR, and someone ports its Helm chart into a spec once. That rule keeps the unit of deployment, the unit of promotion and the unit of ownership the same thing.
 
-The spec holds only what an owner knows. That is the version, a size from the platform's menu, settings, secret names, schedules, and which other services the app calls. Everything else is a platform decision applied by the renderer: security contexts, probes, labels, network policy, disruption budgets, zone spread, RBAC for the schedulers, namespaces, and how secrets get from Key Vault into a pod. Large companies converged on this split. Meta's scheduler team owns a `create_job` module and a validator, and other teams call it with a few arguments ([Tang et al.](https://sigops.org/s/conferences/sosp/2015/current/2015-Monterey/printable/008-tang.pdf)). Google's production intent is expanded by "integrators" that offer "opinionated service models" ([Prodspec and Annealing](https://www.usenix.org/publications/loginonline/prodspec-and-annealing-intent-based-actuation-google-production)). Netflix's Keel injects central teams' opinions through "resolvers" at render time ([Keel](https://github.com/spinnaker/spinnaker/tree/main/keel)).
+The spec holds only what an owner knows:
 
-The spec is plain YAML with a JSON Schema, not a configuration language. Google's own retrospective on Borg says configuration languages drift towards Turing-completeness, and advises keeping data as data and computation in a real language ([Borg, Omega, and Kubernetes](https://queue.acm.org/detail.cfm?id=2898444)). Here the computation is about 2,200 lines of typed Python, CLI and gate included, and the data is a file an owner can read in a minute. Unknown fields are errors, so a typo cannot be silently ignored, and the schema gives editors completion and inline checks.
+- the version, and a size from the platform's menu;
+- settings and secret names;
+- schedules;
+- the other services the app calls, and the outside systems it calls;
+- a hostname, if company callers reach it.
 
-Some needs will always fall outside the spec. For those, `overrides` lets an app patch a rendered object directly. Every override needs platform review and a written reason. Meta found that per-task customisation in Twine was "abused" and is removing it ([Twine, OSDI 2020](https://www.usenix.org/conference/osdi20/presentation/tang)). An escape hatch that is expensive to use and easy to count turns those needs into a backlog: when several apps override the same field, it belongs in the spec.
+Everything else is a platform decision applied by the renderer: security contexts, probes, labels, network policy, disruption budgets, zone spread, the proxy settings, telemetry tags, RBAC for the schedulers and for people, namespaces, and how secrets get from Key Vault into a pod.
 
-Every company the research found with a small service spec built it in-house: Airbnb's kube-gen, Stripe's cron YAML, Shopify's Services DB, Uber's Up and Netflix's Keel. The open-source options are either young (Score, Radius) or a whole control plane to run (KubeVela, Crossplane, Kratix); see [application-spec tools](research.md#application-spec-tools). The spec's field names follow Score's shape, so adopting Score later would not change much for owners.
+Large companies converged on this split. Meta's scheduler team owns a `create_job` module and a validator, and other teams call it with a few arguments ([Tang et al.](https://sigops.org/s/conferences/sosp/2015/current/2015-Monterey/printable/008-tang.pdf)). Google's production intent is expanded by "integrators" that offer "opinionated service models" ([Prodspec and Annealing](https://www.usenix.org/publications/loginonline/prodspec-and-annealing-intent-based-actuation-google-production)). Netflix's Keel injects central teams' opinions through "resolvers" at render time ([Keel](https://github.com/spinnaker/spinnaker/tree/main/keel)).
+
+The spec is plain YAML with a JSON Schema, not a configuration language. Google's own retrospective on Borg says configuration languages drift towards Turing-completeness, and advises keeping data as data and computation in a real language ([Borg, Omega, and Kubernetes](https://queue.acm.org/detail.cfm?id=2898444)). Here the computation is about 3,900 lines of typed Python, with the CLI, the gate and the deploy tooling included. The data is a file an owner can read in a minute. Unknown fields are errors, so a typo cannot be silently ignored, and the schema gives editors completion and inline checks.
+
+Some needs will always fall outside the spec. For those, `overrides` lets an app patch a rendered object directly. Every override needs platform review and a written reason. Meta found that per-task customisation in Twine was "abused" and is removing it ([Twine, OSDI 2020](https://www.usenix.org/conference/osdi20/presentation/tang)). An escape hatch that is expensive to use and easy to count turns those needs into a backlog. When several apps override the same field, it belongs in the spec. Porting third-party charts will find these gaps early. `writable` (scratch directories for images that expect a writable root filesystem) is the first one.
 
 ## Ownership is per app, not per team
 
 Each `app.yaml` lists at least two owners by identity. They approve the app's changes, and their names go on the app's namespace so that whoever is on call can find them. There is no team object and no team directory, so people can move between teams without anything in the repository changing. Google's OWNERS files work the same way: they sit in each directory, list individuals, and need no central registration ([Software Engineering at Google, ch. 9](https://abseil.io/resources/swe-book/html/ch09.html)).
 
-The research did not find this model elsewhere: Backstage, Monzo, Spotify and Zalando all assign ownership to teams. The risk is the bus factor. When someone leaves, the apps they own lose an approver. Requiring two owners covers the common case. A check that every owner is still an active Entra user, and a bulk command to replace one owner with another, would cover the rest; neither is built. A list entry could also be an Entra group, which is still a list of people rather than a team structure. berth accepts individuals only, so that the gate never needs to look up group membership.
+The research did not find this model elsewhere: Backstage, Monzo, Spotify and Zalando all assign ownership to teams. The risk is the bus factor. When someone leaves, the apps they own lose an approver. Requiring two owners covers the common case. A weekly check that every owner is still an active account, posted to Slack, would cover the rest; it is not built yet.
 
-Ownership is data in the repository, so changing it is an ordinary owner-tier change. It is judged by the owners on the target branch, so nobody can add themselves as an owner and then approve their own change.
+Ownership is data in the repository, so changing it is an ordinary owner-tier change. It is judged by the owners on the target branch, so nobody can add themselves as an owner and then approve their own change. Ownership is also access. Each app namespace gets a `berth-owners` RoleBinding to Kubernetes' built-in `view` role, so owners can read their pods, logs and events with their own kubectl or Headlamp login, but not Secrets.
 
-Each app gets its own namespace in each environment, named `<app>-<env>`. Airbnb uses the same `svc-env` pattern ([InfoQ talk](https://www.infoq.com/presentations/airbnb-kubernetes-services/)). In Kubernetes the namespace is where RBAC, quotas, network policy and pod security apply. With 400 deployments in three shared namespaces there is no built-in way to give an app's owners read access to their own pods, or to stop one app's traffic reaching another. The cost is about 1,100 namespaces across the two clusters, and DNS names change for calls between apps. `talks_to` hides the DNS change: an app that declares it calls `ledger/api` gets `LEDGER_API_URL`, and ledger's network policy admits it.
+Each app gets its own namespace in each environment, named `<app>-<env>`. Airbnb uses the same `svc-env` pattern ([InfoQ talk](https://www.infoq.com/presentations/airbnb-kubernetes-services/)). In Kubernetes the namespace is where RBAC, quotas, network policy and pod security apply. With 400 deployments in three shared namespaces there is no way to give an app's owners read access to only their own pods, or to stop one app's traffic reaching another. The cost is about 1,100 namespaces across the two clusters, and DNS names change for calls between apps. `talks_to` hides the DNS change. An app that declares it calls `ledger/api` gets `LEDGER_API_HOST`, `LEDGER_API_PORT` and `LEDGER_API_URL`, and ledger's network policy admits it.
 
 ## Review effort follows risk
 
-`platform/review.yaml` maps each kind of change to one of three tiers. An `auto` change merges once checks pass, provided an owner of the app opened it. An `owner` change needs approval from another owner. A `platform` change needs approval from both an owner and a platform approver. A version, a setting, a size or a schedule is `auto` in dev and qa and `owner` in prod. A public hostname, persistent storage, Azure access, an override, a new app, or a first deploy to prod is `platform` everywhere. Four checks look at the new value as well as the field, and raise a change to `platform`: a size the platform menu flags, more than ten replicas, exposing a service publicly, and a version that never ran in the environment this one promotes from (dev for qa, qa for prod). Production never drops below `owner`, whatever the table says. A path no rule covers needs the platform team, so an unforeseen field fails safe.
+`platform/review.yaml` maps each kind of change to one of three tiers:
 
-Writing rules down, instead of asking a person to judge each change, is what the larger companies do. Google's release engineering chapter says to "fit the deployment process to the risk profile of a given service" ([SRE book, ch. 8](https://sre.google/sre-book/release-engineering/)). Prodspec keeps manual approval for "particularly critical changes" so that approvers do not become desensitised ([Prodspec](https://www.usenix.org/publications/loginonline/prodspec-and-annealing-intent-based-actuation-google-production)). Meta now tiers human review of diffs by risk ([RADAR](https://arxiv.org/abs/2605.30208), a preprint). berth uses a short table rather than a model because the table is auditable, people can argue about a line of it in a pull request, and a 30-person organisation does not have the incident history a model would need.
+- An `auto` change merges once checks pass, provided an owner of the app opened it.
+- An `owner` change needs approval from another owner.
+- A `platform` change needs approval from both an owner and a platform approver.
 
-The production floor exists for separation of duties. Change management in regulated firms usually asks that someone other than the author approve a production change, not that a particular team does. Owner approval meets that. Check this against your own change policy before relying on it.
+The table leans towards developers. A version, a setting, a size, a schedule or a company hostname is `auto` in dev and qa and `owner` in prod. A new app is `owner`, and its first deploy to prod is `platform`. Persistent storage, Azure access and overrides are `platform` everywhere.
 
-The gate compares meaning, not text. It merges each environment file over `app.yaml` on both sides of the change and diffs the results path by path, so editing a base setting in `app.yaml` shows as a change in every environment it reaches, including prod. When the platform team changes the renderer or a default, the affected apps' output changes without any change to their specs. The gate then lists those apps so that their owners can watch, but does not ask them to approve. That is the same idea as Meta's AutoCanary, where a shared change runs the checks of every service that consumes it ([AutoCanary](https://atscaleconference.com/?p=76100)).
+Three checks look at the new value as well as the field, and raise a change to `platform`:
 
-Freezes delay production changes rather than reject them, as Annealing's checks do. A pull request labelled `break-glass` skips the freeze and the tiers, and needs one approval from any owner or platform approver other than its author. Google's guidance is that a breakglass bypass should exist, alert, and be reviewed afterwards ([Building Secure and Reliable Systems, ch. 14](https://google.github.io/building-secure-and-reliable-systems/raw/ch14.html)). berth implements the bypass; the alert and the follow-up review are not built.
+- a size the platform menu flags;
+- more than ten replicas;
+- a version that never ran in the environment this one promotes from (dev for qa, qa for prod).
 
-Azure Repos has no CODEOWNERS file. It offers path-filtered required reviewers and required status checks ([branch policies](https://learn.microsoft.com/en-us/azure/devops/repos/git/branch-policies)). Path filters cannot tell a replica change from a hostname change inside the same file, and requiring several individual reviewers means all of them must approve, rather than any one owner other than the author. So the gate is code that posts one required status, `berth/review`.
+Production never drops below `owner`, whatever the table says. A path no rule covers needs the platform team, so an unforeseen field fails safe.
+
+Writing rules down, instead of asking a person to judge each change, is what the larger companies do. Google's release engineering chapter says to "fit the deployment process to the risk profile of a given service" ([SRE book, ch. 8](https://sre.google/sre-book/release-engineering/)). Prodspec keeps manual approval for "particularly critical changes" so that approvers do not become desensitised ([Prodspec](https://www.usenix.org/publications/loginonline/prodspec-and-annealing-intent-based-actuation-google-production)). berth uses a short table rather than a model, for three reasons. The table is auditable, people can argue about a line of it in a pull request, and a 30-person organisation does not have the incident history a model would need. The production floor exists for separation of duties: someone other than the author approves every production change.
+
+The gate compares meaning, not text. It merges each environment file over `app.yaml` on both sides of the change and diffs the results path by path. Editing a base setting in `app.yaml` therefore shows as a change in every environment it reaches, including prod. When the platform team changes the renderer or a default, the affected apps' output changes without any change to their specs. The gate lists those apps so that their owners can watch, but does not ask them to approve. That is the same idea as Meta's AutoCanary, where a shared change runs the checks of every service that consumes it ([AutoCanary](https://atscaleconference.com/?p=76100)).
+
+Freezes delay production changes rather than reject them. A pull request labelled `break-glass` skips the freeze and the tiers, and needs one approval from anyone other than its author. Azure Repos has no CODEOWNERS file, and its path-filtered reviewers cannot tell a replica change from a hostname change inside the same file. So the gate is code that posts one required status, `berth/review`.
 
 ## Who judges a pull request
 
 A merge gate is worthless if the change it judges can rewrite it. Azure Repos runs a build-validation pipeline from the pull request's own merge commit. That means a pull request can edit `pipelines/pr.yml`, or `src/berth/review.py`, and post itself a passing status. berth therefore separates the checks from the gate.
 
-`pipelines/pr.yml` is the pull request's own build: tests, `berth check`, schema and policy validation, and a preview of the review. It proves the change is well formed, but a pull request can weaken it, so it decides nothing on its own. `pipelines/gate.yml` is triggered by a webhook when a pull request is created, pushed to or voted on. Webhook-triggered pipelines always run the default branch's YAML, so the gate is main's copy. It checks out main's berth and runs it against the pull request's tree, using main's `review.yaml`, main's approvers and main's owners. It also re-runs `berth check`, because `rendered/` is what Flux deploys and a hand-edited manifest must not slip through as "already rendered". The gate posts as a dedicated identity, and the branch policy accepts `berth/review` only from that identity. Editing anything under `pipelines/`, `platform/` or `src/` is a platform-tier change, judged by the old rules.
+`pipelines/pr.yml` is the pull request's own build, and it decides nothing on its own. `pipelines/gate.yml` is triggered by a webhook, and webhook-triggered pipelines always run the default branch's YAML. It checks out main's berth and runs it against the pull request's tree, using main's `review.yaml`, main's approvers and main's owners. It also re-runs `berth check`, because `rendered/` is what gets deployed and a hand-edited manifest must not slip through as "already rendered". The gate posts as a dedicated identity, and the branch policy accepts `berth/review` only from that identity.
 
-The Kyverno policies in `platform/admission/` are the last layer. They enforce at the API server the same rules the renderer follows: images from the company registry pinned by digest, memory limits, an app reading only its own secrets from its own environment's vault, and two owners on every app namespace. Each namespace also enforces the Kubernetes `restricted` pod security standard.
+## Deploying: kubectl, with git as the record
 
-Two gaps remain. The release bot opens pull requests as an identity that may only change versions, and the gate enforces that. If that identity is the shared build service, though, any pipeline in the project can act as the bot, so it should be a dedicated identity. And Flux applies whatever is on main, so the branch policy on main must not be bypassable by ordinary members, and its bypass permission should be audited.
+The main-branch pipeline runs `berth deploy` for the qa cluster, then the prod cluster, then Control-M. A deploy applies only what changed since the commit last deployed to that cluster, which a git tag records, so a failed run is picked up by the next. Each app environment is applied on its own, so one app's error does not stop the others.
+
+Every apply is server-side apply with the field manager `berth`. The API server then records which fields berth set, and that record is what makes the rest of the design work:
+
+- **A change made by hand is visible.** Kubernetes notes the manager of every field. A field set by `kubectl-edit`, `kubectl-set` or `kubectl-scale` belongs to someone other than berth or Kubernetes' own controllers. `berth drift` reports each one with the exact path, such as `Deployment/ledger-api: kubectl-set: .spec.template.spec.containers[name=main].env[name=LOG_LEVEL]`.
+- **A deploy never silently undoes one.** If git sets a field that someone changed by hand, the apply stops with a conflict naming the field, and only that app's deploy fails. Fields someone added are kept and reported.
+- **Putting git back is explicit.** `berth deploy --revert` takes the conflicting fields back, and removes added fields with a patch built from the same record.
+- **Removing what git dropped is explicit too.** Every object berth makes is labelled. A deploy lists the objects git no longer has, and deletes them only with `--prune`. Namespaces, volume claims, and anything else marked `berth.contoso.io/keep` are never deleted. Google's Prodspec paper names partial output as the most common configuration failure, and warns against deleting things because they are absent ([Prodspec](https://www.usenix.org/publications/loginonline/prodspec-and-annealing-intent-based-actuation-google-production)).
+
+Each deploy stamps the namespace with the commit it applied, so "which commit is running in prod?" has an answer per app.
+
+This is a push model, not GitOps in the strict sense. The [OpenGitOps principles](https://opengitops.dev/) also ask that an agent pull and continuously reconcile, and berth does neither. That was a choice against Argo CD and Flux. Both would correct drift continuously, but each is another system in each cluster to run, secure and learn. Argo CD would also bring a second permission model. Kubectl with a field manager gives the same visibility. The daily report replaces continuous correction with a person who decides. Break-glass becomes natural, because nothing undoes an emergency fix behind someone's back. The cost is a window, up to a day, in which an unmarked manual change goes unnoticed. If that window ever matters, Argo CD can be added with sync permission turned off, as a viewer and drift detector, without changing how deploys work.
+
+## Drift is reported every morning
+
+`pipelines/drift.yml` runs `berth drift` against both clusters every day at 13:00 UTC and posts to Slack. It posts even when everything is in sync, so a missing message means the job broke. For every app namespace it reports:
+
+- objects that differ from git (a server-side diff);
+- fields set by hand, with who set them;
+- objects nobody rendered, such as a ConfigMap made during an incident;
+- objects git no longer has;
+- namespaces on the cluster whose app has been removed;
+- break-glass marks, with their reason and whether they have expired.
+
+The platform team acts on the report. That means adopting a change into the spec through a pull request, reverting it with `berth deploy --revert`, or asking whoever made it.
+
+## Break-glass
+
+Anyone may break glass. Members of the `kubectl_writers` Entra groups get `edit` in every app namespace and nothing outside them, so an emergency edit can never touch cluster software or Kubernetes itself. `berth breakglass <app> --env <env> --reason "..."` marks the namespace with who, why and until when. Deploys then skip that namespace, so a merge of something unrelated cannot undo the fix. The daily report shows the mark and flags it once it expires. The fix then goes into the spec through a pull request (labelled `break-glass` if it must skip the freeze and tiers), or is reverted. Ending the mark returns the namespace to normal deploys.
+
+## Guardrails at the API server
+
+Every rule the renderer follows is also enforced by the API server, for whatever reaches the cluster without the renderer: a break-glass edit, or a pod that Airflow or Control-M starts. berth uses Kubernetes' built-in ValidatingAdmissionPolicy, stable since 1.30. Nothing is installed to enforce it, and an outage of some webhook cannot block deploys. The policies are rendered from `platform.yaml`:
+
+- images come from the company registry, pinned by digest;
+- every container has CPU and memory requests and a memory limit;
+- an app reads secrets only from its own environment's store, only under its own `<app>--` prefix, and never with `dataFrom`;
+- a route's hostnames are under its own environment's domain, and attach only to the cluster's Gateway;
+- every app namespace names at least two owners.
+
+Each namespace also enforces Kubernetes' `restricted` pod security standard. The integration tests submit violating objects to a real API server and check that each policy refuses them by name.
+
+## Company callers reach services through one Gateway per cluster
+
+A service with `expose: company` and a `hostname` gets an `HTTPRoute` at `<hostname>.<domain>`, where the environment sets the domain, for example `quotes.dev.apps.contoso.com`. Each cluster has one Gateway behind a private Azure load balancer on a reserved IP. Each environment's wildcard DNS record points at that IP, and each has a wildcard certificate. Once those exist, a new hostname needs no DNS or certificate request. The Gateway has one HTTPS listener per environment, and each listener admits routes only from that environment's namespaces, so a dev app cannot claim a qa hostname. Gateway API is the successor to Ingress. Microsoft retires the managed NGINX in AKS's app routing add-on on 30 November 2026 ([retirement notice](https://mc.merill.net/message/AZ555839)). Envoy Gateway implements it here, installed by the platform team without changing the cluster's Azure configuration.
+
+Callers already use URLs under the company's subdomain scheme. So the move can go one hostname at a time: an explicit DNS record for a moved name overrides the wildcard, and no caller changes anything.
+
+## Seeing what runs
+
+There is no UI to install. Developers look in three places:
+
+- **kubectl and Headlamp,** with their own Entra sign-in: owners have `view` on their app's namespaces, so pods, logs, events, mounts and network policies are all readable. Headlamp's desktop app gives the same view by clicking, with nothing in the cluster. The Kubernetes Dashboard was archived in January 2026, and Kubernetes SIG UI points to Headlamp in its place ([Kubernetes blog](https://kubernetes.io/blog/2026/06/01/dashboard-to-headlamp/)).
+- **Datadog** keeps the history. berth sets Datadog's unified service tags (`tags.datadoghq.com/env`, `service` and `version`) on every pod. It also sets `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` on every container, which Datadog maps to the same tags ([semantic mapping](https://docs.datadoghq.com/opentelemetry/mapping/semantic_mapping/)). The version comes from the environment file, so Datadog shows exactly which release each pod runs.
+- **`berth explain <app> --env <env>`** prints every merged setting with the file it came from, the objects berth renders, the app's URLs, and links to Datadog.
+
+A status page built on the team's React library, reading the drift report's output, is the natural next step if people want deploy status in a browser.
+
+## Outbound traffic
+
+Every container gets `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY`, in upper and lower case, from the environment's `proxy` in `platform.yaml`. The common bug is a `NO_PROXY` that misses the cluster's own addresses, so that calls between apps go out through the proxy. berth always adds the cluster's names (`.svc`, `.cluster.local`), its pod and service ranges, and the environment's own domain. `calls` lists the outside systems an app depends on, such as a database host. That records the dependency where it can be read and searched; it has no effect on traffic yet.
+
+Databases are not run in the clusters. A database that holds data people need is managed by Azure or by the DBA team, so backups, restores and upgrades are theirs. An app reaches it with a host in `config` and a password in Key Vault.
 
 ## Secrets leave git
 
-git-crypt shares one key across everyone who can decrypt. It gives no per-app access, every offboarding means rotating every secret, and an encrypted diff cannot be reviewed. It also cannot coexist with committed rendered output, because the manifests would have to carry decrypted values ([Akuity, the rendered manifests pattern](https://akuity.io/blog/the-rendered-manifests-pattern/)).
+git-crypt shares one key across everyone who can decrypt. It gives no per-app access, every offboarding means rotating every secret, and an encrypted diff cannot be reviewed. It also cannot coexist with committed rendered output, because the manifests would have to carry decrypted values.
 
-In berth a spec lists secret names only. Values live in one Key Vault per environment under the key `<app>--<name>`. The renderer creates one External Secrets Operator `ExternalSecret` per app, and the operator keeps a Kubernetes Secret in sync. Each environment's `ClusterSecretStore` admits only namespaces labelled with that environment. The admission policy rejects an `ExternalSecret` that reads another app's prefix or uses `dataFrom`, since a `dataFrom` find query could read the whole vault.
+In berth a spec lists secret names only. Values live in one Key Vault per environment under the key `<app>--<name>`. External Secrets Operator keeps a Kubernetes Secret in sync from each app's `ExternalSecret`, and each environment's store admits only namespaces of that environment. Developers and the platform team write values, in every environment including prod. Key Vault keeps every version of a secret, and its audit log shows who wrote what. A daily check that flags prod writes by someone who is not an owner of that app would fit in the drift report; it is not built yet.
 
-berth uses External Secrets Operator rather than the AKS Key Vault CSI driver because of batch jobs. The CSI driver creates a Kubernetes Secret only while a pod mounts the volume, and deletes it when the pods go ([CSI options](https://learn.microsoft.com/en-us/azure/aks/csi-secrets-store-configuration-options)). A job's pod that reads a secret as an environment variable needs the Secret to exist before it starts. The trade-off is isolation. With one operator identity per vault, an app is kept to its own secrets by Kubernetes admission rather than by Azure RBAC. The stronger alternative is one workload identity per app with role assignments scoped to individual secrets. Key Vault supports that scope, though Microsoft calls it "not recommended", and a subscription holds 5,000 role assignments ([RBAC guide](https://learn.microsoft.com/en-us/azure/key-vault/general/rbac-guide), [limits](https://learn.microsoft.com/en-us/azure/role-based-access-control/troubleshoot-limits)). How owners set secret values is not built either. Open self-service in the dev and qa vaults, and a small pipeline or function that checks ownership for prod, would fit this design.
+External Secrets Operator is the one third-party controller berth depends on for apps. The alternatives were worse here. The AKS Key Vault CSI driver creates a Kubernetes Secret only while a pod mounts it ([CSI options](https://learn.microsoft.com/en-us/azure/aks/csi-secrets-store-configuration-options)), which does not work for jobs that read a secret as an environment variable before they start. One workload identity per app would put cloud engineering back in the path of every app. A sync job written in Python is possible, but a bug in it could hand one app another's database password.
+
+## Platform software
+
+Cluster software, meaning anything with CRDs, controllers or webhooks, is declared in `platform/software/<name>.yaml` as a pinned Helm chart. There are two: External Secrets Operator and Envoy Gateway. Helm never installs anything. `berth deploy` renders each chart with `helm template` and applies it with kubectl like everything else, before the platform objects and the apps. Chart output is not committed: the CRDs alone are megabytes nobody reviews. Instead, `scripts/validate-software.sh` renders and schema-checks every chart, and the pull request pipeline attaches the rendered diff of a chart change. Values can use placeholders such as `${registry}` and `${tenant_id}`, so a value is written once, in `platform.yaml`.
+
+## What needs cloud engineering
+
+Nothing per app. A new app, a new environment file, a new secret name, a company hostname and a new workflow are all changes in this repository. What does need cloud engineering is a one-time list of Azure objects that Terraform should own:
+
+- workload identity and the OIDC issuer enabled on both clusters;
+- one managed identity per cluster, with a federated credential, for External Secrets Operator;
+- the Key Vaults (one per environment, one platform vault per cluster), and write access to them for developers;
+- a reserved private IP per cluster for the Gateway, and the wildcard DNS records pointing at it;
+- the wildcard certificates, and a proxy exception for the company domain;
+- AKS-managed Entra ID with Kubernetes RBAC, so that berth's RoleBindings decide who can read and write. With Azure RBAC, each grant would be an Azure role assignment.
+
+Node pools and per-app Azure identities (`azure_identity`) stay with cloud engineering by design.
 
 ## Jobs are workloads too
 
-A workflow in the spec is a set of tasks with dependencies, a schedule, a time zone, and an `orchestrator`: `airflow`, `controlm`, or `kubernetes` for a single-task CronJob. Every task pod comes from the same builder as a service pod, so a job gets the same image, security context, size, settings and secrets whether a Deployment, Airflow or Control-M starts it.
+A workflow in the spec is a set of tasks with dependencies, a schedule, a time zone, and an `orchestrator`: `airflow`, `controlm`, or `kubernetes` for a single-task CronJob. Every task pod comes from the same builder as a service pod. A job therefore gets the same image, security context, size, settings, secrets, proxy and telemetry tags whether a Deployment, Airflow or Control-M starts it.
 
-For Airflow, berth writes one plain DAG file per workflow, with each task a KubernetesPodOperator that carries its pod template inline. The pods run in the app's own namespace. A RoleBinding lets Airflow's worker service account create pods only in namespaces whose apps have Airflow workflows, rather than across the cluster. Generating plain Python has three advantages over generating YAML that a DAG factory reads at parse time. The rendered diff shows exactly what Airflow will run. A broken spec breaks one file, not every DAG the factory builds. And Airflow needs no berth code installed.
+For Airflow, berth writes one plain DAG file per workflow. Each task is a KubernetesPodOperator that carries its pod template inline, and Airflow reads `rendered/airflow/<env>/` as a Git DAG bundle. The pods run in the app's own namespace, under a RoleBinding that lets Airflow's worker start pods there and nowhere else.
 
-For Control-M, berth writes Automation API JSON: one folder per workflow, one `Job:Kubernetes` per task carrying a Kubernetes Job manifest, and flows for the dependencies. Kubernetes owns retries and the deadline, so Control-M only starts and watches the job. Control-M schedules at fixed times on chosen days, so berth translates the cron expressions it can express and rejects the rest with a message. A workflow on Control-M must also use the Control-M server's time zone. Control-M has no pull-based sync, so `pipelines/main.yml` runs `ctm deploy` after a merge. Deleting folders that disappear and detecting drift are not built.
+For Control-M, berth writes Automation API JSON: one folder per workflow, one `Job:Kubernetes` per task carrying a Kubernetes Job manifest, and flows for the dependencies. Kubernetes owns retries and the deadline, so Control-M only starts and watches the job. berth translates the cron expressions Control-M can express and rejects the rest with a message. How the definitions reach Control-M depends on its team: the deploy pipeline can run `ctm deploy` with a token they issue, or publish the files for them to import.
 
-Because the orchestrator is one field, moving a job between Control-M and Airflow is a one-line change that renders both sides. Stripe used the same move when it migrated cron jobs to Kubernetes: one YAML source generated both the old and the new scheduler's configuration, and rollback was a three-line change ([Stripe](https://stripe.com/blog/operating-kubernetes)).
+Because the orchestrator is one field, moving a job between Control-M and Airflow is a one-line change. Stripe used the same move when it migrated cron jobs to Kubernetes: one YAML source generated both the old and the new scheduler's configuration ([Stripe](https://stripe.com/blog/operating-kubernetes)).
 
 ## Rendered output is committed
 
-The rendered manifests are committed in the same pull request as the spec change. `berth render` writes them and CI fails if they are stale, so a reviewer sees exactly what will reach Kubernetes rather than only the parameters. A renderer change shows its blast radius as a diff across every affected app. Meta likewise reviews both the configuration program and its generated JSON ([Tang et al.](https://sigops.org/s/conferences/sosp/2015/current/2015-Monterey/printable/008-tang.pdf)), and the same argument is behind the rendered manifests pattern.
+The rendered manifests are committed in the same pull request as the spec change. `berth render` writes them, and CI fails if they are stale. A reviewer therefore sees exactly what will reach Kubernetes rather than only the parameters, and a renderer change shows its blast radius as a diff across every affected app. Environments are directories on main, not branches, so promotion is copying one version line from `qa.yaml` to `prod.yaml`.
 
-Environments are directories on main, not branches. Branches per environment need cherry-picks, depend on merge order, and drift after hotfixes ([Kapelonis](https://dev.to/codefreshio/stop-using-branches-for-deploying-to-different-gitops-environments-5bmj)). Promotion in berth is copying one version line from `qa.yaml` to `prod.yaml`.
+## Every change is checked the same way
 
-Each app environment gets its own Flux Kustomization. Flux applies a Kustomization as a unit, so with one per cluster a single invalid manifest would stop every app's deploys. With one per app environment the failure stays with that app, and Flux reports deploy status per app back to the commit in Azure DevOps.
+The aim is that a reviewer never has to check shape, only intent:
 
-berth uses Flux rather than Argo CD for three reasons. Flux is AKS's long-standing managed GitOps extension. It reaches Azure Repos with workload identity (`provider: azure`). And it posts commit statuses to Azure DevOps. Argo CD's main advantage is its UI, which would let developers see their own apps' sync state without asking anyone. Microsoft's September 2026 tutorial describes the AKS Argo CD extension as generally available, while the extensions release page still says preview. Because the output is plain YAML in a directory per app environment, switching means changing the one small file per app that the renderer emits, not the specs.
+| Check | Catches | Tool |
+|---|---|---|
+| Spec schema | unknown fields, wrong types, bad names, an unparseable cron, a version without a digest | Pydantic models, also exported as JSON Schema for editors |
+| Cross-file rules | sizes not on the menu, `talks_to` a service that does not exist, two services with one hostname, a schedule Control-M cannot express, software in an app namespace, a Gateway without its certificate | `berth check` |
+| Rendered output is current | a spec changed without re-rendering, or a hand edit under `rendered/` | `berth check` |
+| Kubernetes schemas | invalid objects, for the clusters' version and the next one | kubeconform |
+| Admission and deploys | what the API server refuses, including scheduler pods; drift detection; revert; prune | a real kube-apiserver, in `pytest -m integration` |
+| Platform software | chart values a chart rejects, objects that fail schemas | `helm template` and kubeconform |
+| Images | a digest that is not in ACR, or a tag that does not name that digest | `berth images` and `az acr` |
+| Code | lint, format, types, tests | Ruff, ty, pytest, pre-commit |
+
+Then the gate decides who must approve, and the API server enforces the policies again.
+
+## Onboarding
+
+The tutorial ([Add your first app](tutorial.md)) runs entirely on a laptop. It creates an app, shows what berth would deploy for it, and shows the review tier change as the change gets riskier. After that:
+
+- **`berth explain`** answers "what is this app and where did this value come from".
+- **Every spec file starts with a `yaml-language-server` schema line,** so editors complete field names and flag mistakes as you type.
+- **Error messages say what to do,** such as "unknown size 'xxxl' (sizes: xs, s, m, l, xl, xxl)".
 
 ## Failure is contained
 
-Google's Prodspec paper names partial output from a configuration system as the most common failure, and warns against deleting things because they are absent ([Prodspec](https://www.usenix.org/publications/loginonline/prodspec-and-annealing-intent-based-actuation-google-production)). In GitOps, absence plus pruning is deletion. berth marks namespaces and persistent volume claims `kustomize.toolkit.fluxcd.io/prune: disabled`, so a missing file can remove an app's workloads but never its data. Removing an app from prod is a platform-tier change.
-
-A bad version stalls instead of breaking. Deployments roll with `maxUnavailable: 0` behind readiness probes, so old pods keep serving until new ones are ready. In production, services spread across zones, and those with two or more pods get a disruption budget. berth does not roll back automatically. Flux has no progressive delivery, and with a few pods per service a statistical canary is mostly noise. Flagger could add canaries later for the services with enough traffic.
+A bad version stalls instead of breaking. Deployments roll with `maxUnavailable: 0` behind readiness probes, so old pods keep serving until new ones are ready, and the deploy waits for each rollout and fails if it does not finish. In production, services spread across zones, and those with two or more pods get a disruption budget. berth does not roll back automatically: with a few pods per service a statistical canary is mostly noise. Rolling back is reverting the commit.
 
 ## Alternatives considered
 
-Keeping the central repository and splitting review with CODEOWNERS per team directory is the smallest change. It was rejected because it rests on teams, because Azure Repos has no CODEOWNERS, and because path rules cannot see which field changed. Moving manifests into each app's repository, as Zalando and Shopify did, removes the bottleneck. But it also removes the consistency and fleet-wide changes that made central control worth having.
-
-A shared Helm chart with a values file per app comes closest to berth. The values file is the spec. But Helm templates are text templating, so they validate nothing until they are rendered, and reviewers see values rather than output unless the output is rendered and committed anyway. berth keeps the values-file idea and replaces the templates with typed code and a checked schema.
-
-Adopting a platform product (Score, KubeVela, Radius, Kratix, Humanitec, Crossplane) was weighed against a thin renderer; see [application-spec tools](research.md#application-spec-tools). Kargo could automate promotion with verification gates on top of Argo CD, and is the natural next step if manual promotion pull requests become the new bottleneck. Pushing from Azure Pipelines with environment approvals was rejected. Approval would attach to a pipeline run rather than to a reviewed change, drift would never be corrected, and the pipelines would hold cluster credentials.
+| Alternative | Why not |
+|---|---|
+| Keep the central repository, split review with CODEOWNERS per team directory | It rests on teams; Azure Repos has no CODEOWNERS; path rules cannot see which field changed. |
+| Manifests in each app's own repository | Removes the bottleneck, but also the consistency and the fleet-wide changes that made central control worth having. |
+| A shared Helm chart with a values file per app | The closest standard alternative. Helm templates are text templating, so they validate nothing until rendered. berth keeps the values-file idea and replaces the templates with typed code. |
+| Argo CD or Flux | See [Deploying](#deploying-kubectl-with-git-as-the-record). |
+| Kyverno | Its extras (mutating and generating objects) duplicate what the renderer already does, and as a webhook it would sit in the path of every deploy. |
+| Vertical Pod Autoscaler | The Datadog-driven rightsizing bot below needs nothing in the cluster and keeps git as the record of what each app requests. |
+| First-class dependency kinds (a `postgres:` block) | Third-party software is an ordinary app instead, so there is one kind of thing to learn and review. |
 
 ## Moving from the current repository
 
-Secrets move first. Moving them to Key Vault is useful on its own, and it is required before rendered output can be committed. An importer can then turn each existing Deployment, Service and ConfigMap into a spec. Whatever does not fit becomes an override, and counting the overrides measures the spec's gaps before anyone depends on it. The namespace move is the expensive part. A renderer option that places migrated apps in the old shared namespaces would let the spec, review and secrets changes land first, with apps moving to their own namespaces one at a time behind `ExternalName` services for the old DNS names. Neither the importer nor that option is built.
+Today's starting point is kubectl from laptops, so the first goal is knowing what is actually running. Each step below is useful on its own:
 
-Before requiring the gate, run it in report-only mode: post the status without making it required, and compare its decisions with the infra lead's for a few weeks. That comparison also produces the measurement worth having first, namely what share of today's pull requests are version bumps, settings, resources, mounts and new apps.
+1. **CI on the current repository.** Schema checks and a pipeline, before anything else changes.
+2. **Secrets move to Key Vault.** It is useful on its own, and required before rendered output can be committed.
+3. **New apps start on berth.** New deployments are most of today's queue, so this pays off before anything is migrated. `berth drift` immediately shows whether those apps stay as deployed.
+4. **Existing apps move one at a time.** Porting a deployment to a spec finds the spec's gaps. Each one becomes an override first, and counting overrides measures them. The namespace move is the expensive part. A renderer option that places migrated apps in the old shared namespaces would let the spec, review and secrets changes land first; it is not built. The bash scripts need reading one by one: most do what a spec field now does.
+5. **Laptops lose write access.** Once an app is on berth, people's access to its namespaces drops to `view`. Break-glass stays with the `kubectl_writers` groups.
+
+Before requiring the gate, run it in report-only mode: post the status without making it required, and compare its decisions with the infra lead's for a few weeks.
+
+## Next to build
+
+- **A rightsizing bot.** It queries Datadog for each workload's CPU and memory over two to four weeks, by the `service` and `env` tags. It maps the result to the size menu with a safety margin, never shrinks memory after an OOM kill, and opens one pull request per app with the evidence. Its identity may change only sizes.
+- **A mirror bot.** For third-party apps, it imports new upstream tags into ACR and opens the dev version pull request, as the release bot does for internal apps.
+- **`berth adopt`,** which turns a live difference into the spec change that would make git match.
+- **More in the drift report:** prod secret writes by non-owners, owners who are no longer active accounts, and certificates that expire within 30 days.
 
 ## What is unverified
 
-The parts that run locally have been verified: rendering, review, the CLI, schema validation of every rendered object, the Kyverno policies (via the CLI), and the generated DAGs in Airflow 3.2.2. Everything that needs a real service has not, and the code and pipelines that talk to one say so in a header comment:
+Verified locally:
 
-- Azure DevOps: the gate pipeline's webhook trigger and payload path, the pull request and status REST calls, restricting the status to one identity, the release template, and `az repos pr create` with auto-complete.
-- AKS and Flux: the bootstrap files, `provider: azure`, the commit-status notifications, Kyverno and External Secrets Operator in a real cluster, workload identity for ledger, the app routing ingress class and namespace, and running about 1,100 namespaces. The AKS documentation gives no namespace limit.
-- Control-M: the `Job:Kubernetes` field names and flow syntax, which come from BMC documentation that returned 403 to fetching and was read only in search excerpts; `OrderMethod: Manual`; `generateName` in a Job spec; and the `ctm` CLI commands.
-- Airflow: the GitDagBundle configuration that reads `rendered/airflow/<env>/`, and KubernetesPodOperator running pods in another namespace under the RoleBinding.
+- rendering, review, the CLI and `berth explain`;
+- schema validation of every rendered object, for Kubernetes 1.33 and 1.34;
+- `berth deploy`, `drift`, `breakglass`, `--revert` and `--prune` against a real kube-apiserver and etcd (envtest 1.34);
+- every admission policy refusing what it should, and admitting every pod Airflow and Control-M start in dev and qa;
+- both platform software charts, rendered with their values and schema-checked;
+- the generated DAGs in Airflow 3.2.2.
 
-The decisions still open are Flux or Argo CD, External Secrets Operator with admission isolation or per-app identities, how owners set secret values, whether owners may include Entra groups, how to sequence the namespace move, and whether owner self-merge in dev and qa satisfies your change-management policy.
+Not run anywhere real, and marked so in each file that talks to it:
+
+- **Azure DevOps:**
+  - the gate's webhook trigger and payload path, the pull request and status REST calls, restricting the status to one identity, and the release template;
+  - the deploy and drift pipelines' service connections, `kubelogin`, and the deployed-commit tags;
+  - `az acr manifest show-metadata`.
+- **AKS:**
+  - rollouts actually completing, since the test API server has no nodes;
+  - External Secrets Operator and Envoy Gateway running;
+  - the Gateway's internal load balancer annotations, through Gateway API's `infrastructure` field;
+  - owners as `User` subjects in RoleBindings, which assumes AKS-managed Entra ID uses the user principal name;
+  - about 1,100 namespaces per cluster.
+- **Datadog:** the OTLP endpoint (berth assumes the Datadog Agent's receiver on each node at port 4318), and the link URL formats.
+- **Control-M:**
+  - the `Job:Kubernetes` field names and flow syntax, from BMC documentation that could only be read in search excerpts;
+  - the `ctm` CLI commands;
+  - how Control-M starts containers today, and whether its team accepts definitions from this repository.
+- **Slack:** the incoming webhook.
+- **The proxy:** whether every tool in your images honours CIDR ranges in `NO_PROXY`.

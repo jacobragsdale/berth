@@ -54,7 +54,13 @@ To add an app:
 
    `check` prints `ok: …`, or lists each problem with its file and field.
 
-A new app needs approval from the co-owner and a platform approver. After the merge, Flux applies `rendered/k8s/aks-qa/fx-pricer-dev/` to the qa cluster. To deploy the app to qa or prod later, add `apps/fx-pricer/qa.yaml` or `prod.yaml` containing at least `version:`. A first deploy to qa needs the co-owner, and a first deploy to prod needs a platform approver as well.
+5. See what the spec turned into, with every setting and the file it came from:
+
+   ```sh
+   uv run berth explain fx-pricer --env dev
+   ```
+
+A new app needs approval from the co-owner. After the merge, the deploy pipeline applies `rendered/k8s/aks-qa/fx-pricer-dev/` to the qa cluster and waits for the rollout; its log shows `fx-pricer-dev: applied`. To deploy the app to qa or prod later, add `apps/fx-pricer/qa.yaml` or `prod.yaml` containing at least `version:`. A first deploy to qa needs the co-owner, and a first deploy to prod needs a platform approver as well.
 
 ## How to release a version to dev
 
@@ -103,6 +109,75 @@ A qa promotion needs no approval when you own the app. A prod promotion needs an
 
 You can promote to qa and prod in one pull request by running `promote` twice, qa first. The prod change then needs a platform approver, because the version is not yet in `qa.yaml` on `main`. Promoting in two pull requests avoids that.
 
+## How to see your app running
+
+Owners can read everything in their app's namespaces except Secrets, with their own sign-in. You need the Azure CLI (signed in with `az login`), kubectl and kubelogin. Get credentials for each cluster once; dev and qa are on `aks-qa`, prod is on `aks-prod` (resource group `rg-aks-prod`):
+
+```sh
+az aks get-credentials --resource-group rg-aks-qa --name aks-qa --context aks-qa
+kubelogin convert-kubeconfig -l azurecli
+```
+
+Then use kubectl, or the Headlamp desktop app, which reads the same credentials and needs nothing installed in the cluster:
+
+```sh
+kubectl --context aks-qa -n payments-api-dev get pods
+kubectl --context aks-qa -n payments-api-dev logs deployment/payments-api-api
+kubectl --context aks-qa -n payments-api-dev get events --sort-by=.lastTimestamp
+```
+
+- **Is my change deployed?** The namespace records the commit last deployed to it: `kubectl --context aks-qa get namespace payments-api-dev -o jsonpath='{.metadata.annotations.berth\.contoso\.io/deployed-commit}'`. Your change is in if your commit is that one or an ancestor of it: `git merge-base --is-ancestor YOUR_COMMIT DEPLOYED_COMMIT && echo deployed`. The `berth-deploy` pipeline run for the merge says, per app, `applied` and whether each rollout finished.
+- **What if it failed?** The run fails and names the app: `apply failed` (the API server refused a manifest), `not applied` (a conflict with a change made by hand; see [How to resolve what the drift report shows](#how-to-resolve-what-the-drift-report-shows)), or `did not become ready` (the rollout did not finish in ten minutes). Nothing rolls back automatically, but a stuck rollout never takes capacity away: the old pods keep serving until new ones are ready. Fix forward, or revert the commit.
+- **Is it as git says?** The daily drift report in Slack lists any app whose cluster state differs from git.
+- **Where did a value come from?** `uv run berth explain payments-api --env dev` shows every setting with the file that set it, and links to the app's logs and traces in Datadog.
+- **Traces, metrics and older logs:** Datadog, filtered by the `service` and `env` tags that berth sets on every pod. A service's Datadog name is `<app>-<service>`, for example `payments-api-api`.
+
+## How to expose a service to company callers
+
+"Company" means the company network, not the internet: other company systems call the service by URL. A service is either `internal` (the default: reachable only by other apps in the cluster, through `talks_to`) or `company`. Only HTTP and HTTPS are routed this way. Give the service a hostname and `expose: company`:
+
+```yaml
+services:
+  api:
+    port: 8080
+    expose: company
+    hostname: quotes
+```
+
+Render, and open the pull request. The service answers at `https://quotes.<domain>` in each environment, where `platform.yaml` sets the domain: `quotes.dev.apps.contoso.com` in dev, `quotes.qa.apps.contoso.com` in qa and `quotes.apps.contoso.com` in prod. To expose it in one environment only, run the app in that environment only: the hostname applies wherever the app runs. No DNS or certificate request is needed, because each environment has a wildcard record and certificate. `berth check` refuses a hostname that another service already uses in the same environment.
+
+A new hostname needs no approval in dev and qa, and another owner in prod. Changing an existing prod hostname breaks every caller that uses the old one, so tell them first.
+
+## How to run third-party software
+
+Software that only runs a container, such as Redis or a vendor's web app, is an ordinary app. Software with CRDs, controllers or webhooks is platform software instead: the platform team adds it as a file in `platform/software/`, like the two there; see [How to upgrade platform software](#how-to-upgrade-platform-software).
+
+You need permission to import into the registry (the `AcrPush` role on `contosoacr`), and Helm if the vendor ships a chart.
+
+1. Copy the image into ACR, and note its digest:
+
+   ```sh
+   az acr import --name contosoacr --source docker.io/library/redis:8.2.1 --image mirror/redis:8.2.1
+   az acr repository show --name contosoacr --image mirror/redis:8.2.1 --query digest -o tsv
+   ```
+
+2. Read what the vendor's chart produces, if there is one: `helm template` it and note the image's command, arguments, port, environment variables, config files, volumes and health checks.
+3. Write the app with `berth new`, passing `--version 8.2.1@sha256:DIGEST` with the digest from step 1. Set `image: mirror/redis`, and replace the generated `api` service with what you noted. Leave out the chart's ServiceAccount, RBAC and disruption budget; berth makes its own. Without a `health` path, berth checks health by connecting to the port, which suits non-HTTP services. Paths the image writes to need `writable`, because the root filesystem is read-only. Those directories start empty on every restart; use `volumes` for data that must survive one:
+
+   ```yaml
+   image: mirror/redis
+   services:
+     redis:
+       port: 6379
+       size: s
+       args: [--save, ""]
+       writable: [/data]
+   ```
+
+4. Render and check. Anything the spec cannot express becomes an override, which needs a platform approver.
+
+Databases holding data that matters are not run this way. Ask Azure or the DBA team for a managed one, and connect to it with a host in `config` and the password in `secrets`.
+
 ## How to change a setting
 
 Settings are `config` (environment variables) and `files` (files mounted read-only at `/config/<name>`). Settings in `app.yaml` apply in every environment. An environment file can set `config` for that environment only, overriding `app.yaml` key by key. `files` and `secrets` live only in `app.yaml`.
@@ -128,7 +203,13 @@ Secret values never enter git. The spec names the secret, and External Secrets O
 To add a secret:
 
 1. Add its name to `secrets` in `app.yaml`, for example `secrets: [db-password]`.
-2. Have the value set in each environment's vault (`kv-contoso-dev`, `kv-contoso-qa`, `kv-contoso-prod`) under the name `APP--NAME`, here `payments-api--db-password`. berth does not set values, and this repository has no self-service path for it. A platform approver, or whoever your organisation gives Key Vault write access, sets the value.
+2. Set the value in each environment's vault (`kv-contoso-dev`, `kv-contoso-qa`, `kv-contoso-prod`) under the name `APP--NAME`, here `payments-api--db-password`. Developers can write to every environment's vault:
+
+   ```sh
+   az keyvault secret set --vault-name kv-contoso-dev --name payments-api--db-password --value "$VALUE"
+   ```
+
+   Key Vault keeps every version, so a mistaken value can be restored, and its audit log records who wrote it.
 3. Render and open the pull request. After the merge, the app's containers get the value as an environment variable named after the secret in upper case with `-` replaced by `_`, here `DB_PASSWORD`.
 
 If the vault has no such secret, the ExternalSecret reports a sync error and the Kubernetes Secret is not created. Pods that need it then fail to start with `CreateContainerConfigError`, and start once the value exists. A changed value reaches running pods only when they restart: External Secrets Operator refreshes the Secret hourly, and environment variables are read at container start.
@@ -141,7 +222,7 @@ Add the service to `talks_to` as `APP/SERVICE`:
 talks_to: [ledger/api]
 ```
 
-After rendering, your containers get `LEDGER_API_URL=http://api.ledger-<env>.svc.cluster.local`, on port 80, which forwards to the service's `port`. Ledger's network policy admits traffic from your namespace. The target must run in every environment your app runs in and must have a `port`, or `berth check` names the environment that is missing it. Ledger's owners are not asked to approve.
+After rendering, your containers get `LEDGER_API_HOST=api.ledger-<env>.svc.cluster.local`, `LEDGER_API_PORT` (the service's own `port`) and `LEDGER_API_URL=http://api.ledger-<env>.svc.cluster.local:<port>`. Ledger's network policy admits traffic from your namespace. The target must run in every environment your app runs in and must have a `port`, or `berth check` names the environment that is missing it. Ledger's owners are not asked to approve.
 
 ## How to move a job between Control-M and Airflow
 
@@ -152,7 +233,7 @@ The change needs no approval in dev and qa when you own the app, and another own
 - The workflow's `timezone` must be the Control-M server's (`America/New_York`).
 - The `schedule` must run at one fixed time on listed weekdays or month days, such as `30 18 * * 1-5`.
 
-`berth check` names the problem when either is not met. Moving a workflow off Control-M leaves its folder, named `<app>-<workflow>`, on the Control-M server, because the main-branch pipeline only adds and updates folders. Ask your Control-M administrators to delete it after the merge.
+`berth check` names the problem when either is not met. Moving a workflow off Control-M leaves its folder, named `<app>-<workflow>`, on the Control-M server, because `ctm deploy` only adds and updates folders. Ask the Control-M team to delete it after the merge.
 
 ## How to change something the spec cannot express
 
@@ -171,6 +252,36 @@ overrides:
 ```
 
 In a merge patch, a mapping merges, `null` deletes a key, and a list replaces the whole list. Put an override in `app.yaml` to apply it in every environment, or in one environment's file for that environment only. Every override needs a platform approver. The admission policies still check the result: images must come from the registry pinned by digest, and containers must keep memory limits. See [Who judges a pull request](design.md#who-judges-a-pull-request).
+
+## How to fix something live in an emergency
+
+Members of the `kubectl_writers` groups in `platform/platform.yaml` can change any app's namespaces with kubectl, using the credentials from [How to see your app running](#how-to-see-your-app-running). Mark the change first, so that deploys leave it alone and the drift report says who made it and why:
+
+```sh
+uv run berth breakglass payments-api --env prod --reason "pool exhausted, scaling up" --hours 4
+kubectl --context aks-prod -n payments-api-prod scale deployment/payments-api-api --replicas=8
+```
+
+The mark is an annotation on the app's namespace, holding your sign-in name, your reason and when it expires. Until then, deploys skip that namespace and log that they did. After it expires, deploys apply the app again, and the drift report flags the mark as `EXPIRED`. A deploy that meets your change then stops with a conflict until someone deals with it. Before then, do one of two things:
+
+- **Keep the change.**
+  1. Open a pull request that makes the spec say what you did, labelled `break-glass` if it cannot wait for the review tiers or a freeze.
+  2. After it merges, end the mark: `uv run berth breakglass payments-api --env prod --end`. Ending the mark deploys nothing by itself.
+  3. Deploy the app: re-run the `berth-deploy` pipeline, or from a clean checkout of current `main`, `uv run berth deploy --cluster aks-prod --app payments-api --env prod`. Git now sets the same values you did, so it applies without a conflict, and your change stops counting as drift.
+- **Undo it.** End the mark, then run the `berth-deploy` pipeline with **Put git back over changes made by hand** ticked. From a clean checkout of current `main`, `uv run berth deploy --cluster aks-prod --app payments-api --env prod --revert` does the same for one app.
+
+If you change something without marking it, nothing undoes it either. The next deploy of that app stops with a conflict naming the field, and the next drift report lists the change as "not marked".
+
+## How to resolve what the drift report shows
+
+The report arrives in Slack every morning, one message per cluster, with one line per app namespace that needs attention. The platform team acts on it. The pipeline run each message comes from holds the full diffs. Run any deploy below from the `berth-deploy` pipeline, or from a clean checkout of current `main`, never from a branch.
+
+- **"changed by hand: Kind/name: manager: path"**: someone changed that field outside berth. The manager is the tool Kubernetes recorded for the change: `kubectl-edit`, `kubectl-set`, or `kubectl` for a scale. Adopt it (change the spec so git says the same, merge, and deploy the app), or put git back with `uv run berth deploy --cluster CLUSTER --app APP --env ENV --revert`.
+- **"made by hand: Kind/name"**: an object nobody rendered. Delete it with kubectl (a `kubectl_writers` member or the platform team), or add what it does to the spec.
+- **"differs from git"**: the cluster does not match git, for example after a failed deploy. Deploy the app again, with `--revert` if a conflict blocks it.
+- **"(removed from git)"**: git no longer renders that object. Deploy the app with `--prune` to delete it. Prune only touches objects berth labelled, in the namespaces it deploys, and never namespaces or volume claims.
+- **"on the cluster but no longer in git"**: the app or environment was removed. A platform operator deletes the namespace once its data is no longer needed.
+- **"break-glass … EXPIRED"**: the mark outlived its expiry. Ask whoever made it to keep or undo the change, as in [How to fix something live in an emergency](#how-to-fix-something-live-in-an-emergency).
 
 ## How to ship during an incident or a freeze
 
@@ -195,7 +306,7 @@ uv run berth render
 
 Stopping an app in dev needs no approval when you own it, in qa another owner, and in prod a platform approver as well. If another app lists this one in `talks_to` in that environment, `berth check` fails until that app changes too.
 
-After the merge, Flux removes the app's workloads. It keeps the namespace and any persistent volume claims, which berth marks `kustomize.toolkit.fluxcd.io/prune: disabled`. A platform operator deletes the namespace once the data is no longer needed. The app's Key Vault secrets and any Control-M folders also stay until someone deletes them. Retiring the whole app means deleting its directory, which needs a platform approver.
+After the merge, the deploy reports the namespace as "on the cluster but no longer in git", and the daily drift report lists it until it is gone. Nothing is deleted automatically. A platform operator deletes the namespace once its data, including any persistent volume claims, is no longer needed. The app's Key Vault secrets and any Control-M folders also stay until someone deletes them. Retiring the whole app means deleting its directory, which needs a platform approver.
 
 ## How to see what a platform change does to every app
 
@@ -207,6 +318,75 @@ Changes to `platform/`, `src/`, `pipelines/` or `scripts/` always need a platfor
 
 A change to `platform/review.yaml` does not affect the pull request that makes it. That pull request is judged by the table on `main`, so a new rule applies only after it merges.
 
+## How to upgrade platform software
+
+Platform software is the cluster software in `platform/software/<name>.yaml`: External Secrets Operator and Envoy Gateway. Each file has one install per cluster, under `installs`. Every change to it needs a platform approver.
+
+1. Upgrade the qa cluster first. Set `version` on the qa install only, which overrides the shared version:
+
+   ```yaml
+   installs:
+     envoy-gateway:
+       cluster: aks-qa
+       namespace: envoy-gateway-system
+       version: v1.10.0
+   ```
+
+2. Render, then render the charts and validate the output. The script downloads the charts, and its own Helm and kubeconform, so it needs network access:
+
+   ```sh
+   uv run berth render
+   scripts/validate-software.sh
+   ```
+
+   The last line is kubeconform's summary, and it should report `Invalid: 0, Errors: 0`. CustomResourceDefinitions are counted as skipped.
+3. Read the chart's release notes for the versions you skip. The pull request pipeline attaches a diff of the rendered charts between `main` and your branch. A removed CustomResourceDefinition deletes every object of that kind, so stop and ask if the diff shows one.
+4. After the merge and a quiet day on qa, set the shared `version` to the new one and remove the qa install's override, in a second pull request.
+
+The deploy pipeline renders each chart with `helm template` and applies it, before the platform objects and the apps.
+
+## How to set up a cluster
+
+This is a one-time step per cluster for the platform team, after the Azure setup in [What needs cloud engineering](design.md#what-needs-cloud-engineering). It needs cluster-admin on the cluster.
+
+1. Get credentials, with the context named after the cluster (`rg-aks-prod` and `aks-prod` for prod), and the pinned tools:
+
+   ```sh
+   az aks get-credentials --resource-group rg-aks-qa --name aks-qa --context aks-qa
+   kubelogin convert-kubeconfig -l azurecli
+   scripts/fetch-tools.sh
+   export BERTH_KUBECTL=.tools/bin/kubectl BERTH_HELM=.tools/bin/helm
+   ```
+
+2. Deploy everything, without waiting for rollouts the first time, because secrets cannot sync until External Secrets Operator is running:
+
+   ```sh
+   uv run berth deploy --cluster aks-qa --no-wait
+   ```
+
+   It applies the platform software's namespaces, the charts, the platform objects (secret stores, the Gateway, the scheduler roles) and the admission policies, then every app.
+3. Once the controllers are running, check the cluster:
+
+   ```sh
+   uv run berth drift --cluster aks-qa
+   ```
+
+   The first line should end `N in sync, 0 need attention`. Anything else is listed below it; see [How to resolve what the drift report shows](#how-to-resolve-what-the-drift-report-shows).
+
+From then on, the deploy pipeline does this after every merge.
+
+## How to set up the deploy and drift pipelines
+
+These have not been run against a real organisation. Treat each step as a checklist item to verify.
+
+1. Create service connections `berth-aks-qa` and `berth-aks-prod` with workload identity federation, each for an identity that is cluster-admin on its cluster. Deploys apply CRDs, ClusterRoles and admission policies, which need it. The drift pipeline uses the same connections, because `kubectl diff` is a server-side dry run and Kubernetes cannot grant "dry run only"; `berth drift` never writes.
+2. Give the project's Build Service identity **Create tag** and **Force push** on the repository. After each successful deploy, the pipeline moves the tag `deployed/<cluster>` to the commit it deployed, and the next run deploys only what changed since that tag.
+3. Create the pipeline `berth-deploy` from `pipelines/main.yml`, and Azure Pipelines environments `berth-aks-qa`, `berth-aks-prod`, `berth-controlm-dev`, `berth-controlm-qa` and `berth-controlm-prod`. Add business-hours checks on the prod environments if you want them.
+4. Create variable groups `berth-controlm-dev`, `berth-controlm-qa` and `berth-controlm-prod`, each holding `CTM_ENDPOINT` and a `CTM_TOKEN` issued by the Control-M team. Airflow needs nothing here: it reads `rendered/airflow/<env>/` from git with its own git connection.
+5. Create a variable group `berth-drift`, linked to Key Vault, holding `SLACK_WEBHOOK_URL`: an incoming webhook for the channel that should get the report.
+6. Grant each variable group pipeline permission to the pipeline that uses it only.
+7. Create the pipeline `berth-drift` from `pipelines/drift.yml`. It runs at 13:00 UTC every day.
+
 ## How to set up the gate in Azure DevOps
 
 This setup has not been run against a real organisation. Treat each step as a checklist item to verify.
@@ -215,7 +395,7 @@ Prerequisites: Project Administrator on the project, and a dedicated identity fo
 
 To set up the gate:
 
-1. Create the pipeline `berth-pr` from `pipelines/pr.yml`, and add it to `main`'s branch policy as required build validation. It runs the tests, `berth check`, schema and policy validation, and a review preview, all from the pull request's own copy of the repository.
+1. Create the pipeline `berth-pr` from `pipelines/pr.yml`, and add it to `main`'s branch policy as required build validation. It runs the tests, `berth check`, schema checks, the integration tests against a local API server, and a review preview, all from the pull request's own copy of the repository.
 2. Create an Incoming WebHook service connection named `berth-pr-events`.
 3. Add service hooks on the repository for **Pull request created** and **Pull request updated** that post to the webhook URL Azure DevOps shows for that connection. Pull request updated includes reviewer votes.
 4. Create a variable group `berth-gate`, linked to Key Vault, with a secret `BERTH_GATE_TOKEN` holding the gate identity's token. Grant pipeline permission to the gate pipeline only.
