@@ -4,7 +4,7 @@ from support import app_spec, env_spec, tree
 
 from berth.fleet import load
 from berth.render.software import releases, template_args
-from berth.validate import problems
+from berth.validate import PIPELINE_TARGETS, pipeline_problems, problems
 
 ENVOY = """
 description: test gateway
@@ -61,3 +61,12 @@ def test_one_install_can_run_a_newer_chart_to_upgrade_qa_first() -> None:
     fleet = load(tree() | {"platform/software/envoy-gateway.yaml": ENVOY.replace("    namespace: envoy-gateway-system\n", "    namespace: envoy-gateway-system\n    version: v1.10.0\n")})
     (release,) = releases(fleet.software, "aks-qa")
     assert template_args(release, None)[template_args(release, None).index("--version") + 1] == "v1.10.0"
+
+
+def test_the_pipelines_list_of_clusters_and_environments_must_match_the_platform() -> None:
+    fleet = load(tree())
+    good = "variables:\n  clusters: aks-qa,aks-prod\n  environments: dev,qa,prod\n  registry: contosoacr\n"
+    assert pipeline_problems(fleet.platform, {PIPELINE_TARGETS: good}) == []
+    stale = good.replace("dev,qa,prod", "dev,prod").replace("aks-qa,aks-prod", "aks-prod,aks-qa")
+    found = pipeline_problems(fleet.platform, {PIPELINE_TARGETS: stale})
+    assert [problem.split(":", 2)[1].split()[0] for problem in found] == ["clusters", "environments"]

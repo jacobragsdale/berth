@@ -32,11 +32,14 @@ parameters:
     type: boolean
     default: false
 
+variables:
+  - template: templates/targets.yml
+
 pool:
   vmImage: ubuntu-24.04
 
 stages:
-  - ${{ each cluster in split('aks-qa,aks-prod', ',') }}:
+  - ${{ each cluster in split(variables.clusters, ',') }}:
       - stage: ${{ replace(cluster, '-', '_') }}
         displayName: Deploy to ${{ cluster }}
         jobs:
@@ -86,11 +89,11 @@ stages:
                       displayName: Keep the results for the next cluster
 
   # Control-M reads the rendered branch, so it only ever receives jobs whose namespace runs what they expect.
-  - ${{ each env in split('dev,qa,prod', ',') }}:
+  - ${{ each env in split(variables.environments, ',') }}:
       - stage: controlm_${{ env }}
         displayName: Control-M ${{ env }}
         dependsOn:
-          - ${{ each cluster in split('aks-qa,aks-prod', ',') }}:
+          - ${{ each cluster in split(variables.clusters, ',') }}:
               - ${{ replace(cluster, '-', '_') }}
         jobs:
           - deployment: deploy

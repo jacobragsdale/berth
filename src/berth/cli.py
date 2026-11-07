@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TextIO, assert_never
 
 from berth import bots_cli, cluster_cli, diff, edit, explain, gitio, notify, report, validate
-from berth.ado import Ado, AdoSettings, http_transport
+from berth.ado import Ado, AdoError, AdoSettings, http_transport
 from berth.datadog import DatadogError
 from berth.fleet import Fleet, LoadError, load
 from berth.kube import KubeError
@@ -231,6 +231,7 @@ def _check(cmd: Check, out: TextIO) -> int:
         return 1
     fleet, tree = loaded
     _, problems = rendered(fleet)
+    problems += validate.pipeline_problems(fleet.platform, tree)
     problems += [f"{path}: stale; run `berth schema`" for path, text in _schemas().items() if tree.get(path) != text]
     out.writelines(f"{problem}\n" for problem in problems)
     if not problems:
@@ -362,7 +363,7 @@ def _review(cmd: Review, out: TextIO, now: datetime) -> int:
 
 def _gate(cmd: Gate, out: TextIO, now: datetime) -> int:
     settings = AdoSettings()
-    ado = Ado(settings, http_transport(settings.system_accesstoken))
+    ado = Ado(settings, http_transport(settings.token))
     pr = ado.pull_request(cmd.pr)
     reviewed = _reviewed(cmd.root, cmd.base, out)
     if reviewed is None:
@@ -450,7 +451,7 @@ def run(cmd: Command, out: TextIO, now: datetime) -> int:  # noqa: PLR0911, PLR0
                 return _list_images(cmd, out)
             case cluster_cli.Deploy() | cluster_cli.Drift() | cluster_cli.BreakGlassStart() | cluster_cli.BreakGlassEnd() | cluster_cli.Publish():
                 return cluster_cli.run(cmd, _platform_of, _checked, out, now)
-            case bots_cli.RightsizePlan() | bots_cli.RightsizeApply() | bots_cli.MirrorPlan():
+            case bots_cli.RightsizePlan() | bots_cli.RightsizeApply() | bots_cli.RightsizeApps() | bots_cli.MirrorPlan() | bots_cli.MirrorRows() | bots_cli.Propose():
                 return bots_cli.run(cmd, _platform_of, out, now)
             case Schema():
                 schemas = _schemas()
@@ -465,7 +466,7 @@ def run(cmd: Command, out: TextIO, now: datetime) -> int:  # noqa: PLR0911, PLR0
                 return 0
             case _:
                 assert_never(cmd)
-    except (edit.EditError, gitio.GitError, KubeError, notify.NotifyError, DatadogError, RegistryError) as error:
+    except (edit.EditError, gitio.GitError, KubeError, notify.NotifyError, DatadogError, RegistryError, AdoError) as error:
         out.write(f"error: {error}\n")
         return 1
 

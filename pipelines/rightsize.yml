@@ -1,7 +1,7 @@
 # Every Monday: compare each workload's size with what it used in Datadog over the last two weeks, and open one
 # pull request per app per environment where a different size from the menu fits better. The pull request carries
 # the evidence. The bot may change sizes only (platform.yaml rightsizing_bot), so in dev and qa it merges once the
-# checks pass, and in prod an owner approves it.
+# checks pass, and in prod an owner approves it. A pull request still open from last week is updated, not repeated.
 #
 # Not yet run in Azure DevOps. Needs a variable group berth-datadog (DD_API_KEY, DD_APP_KEY, DD_SITE; Key Vault-
 # linked), and a service connection berth-rightsizing for the bot's identity, which opens the pull requests.
@@ -21,12 +21,13 @@ pool:
 
 variables:
   - group: berth-datadog
+  - template: templates/targets.yml
 
 steps:
   - checkout: self
-    persistCredentials: true
+    persistCredentials: true  # berth pr pushes a branch per app and environment
   - template: templates/setup-uv.yml
-  - ${{ each env in split('dev,qa,prod', ',') }}:
+  - ${{ each env in split(variables.environments, ',') }}:
       - script: uv run berth rightsize --env ${{ env }} --plan-out "$(Agent.TempDirectory)/rightsize-${{ env }}.json"
         displayName: Read Datadog for ${{ env }}
         env:
@@ -34,31 +35,26 @@ steps:
           DD_APP_KEY: $(DD_APP_KEY)
           DD_SITE: $(DD_SITE)
   - task: AzureCLI@2
-    displayName: Open the pull requests
+    displayName: Open or update the pull requests
     inputs:
       azureSubscription: berth-rightsizing  # the rightsizing bot identity
       scriptType: bash
       scriptLocation: inlineScript
       inlineScript: |
         set -euo pipefail
-        for env in dev qa prod; do
+        BERTH_ADO_TOKEN=$(az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --query accessToken -o tsv)
+        export BERTH_ADO_TOKEN
+        for env in $(echo "$(environments)" | tr ',' ' '); do
           plan="$(Agent.TempDirectory)/rightsize-$env.json"
-          for app in $(uv run python -c "import sys; from berth.rightsize import Plan; print(' '.join(Plan.model_validate_json(open(sys.argv[1]).read()).apps()))" "$plan"); do
-            branch="rightsize/$app-$env"  # one branch per app and environment, so an ignored pull request is updated, not duplicated
+          for app in $(uv run berth rightsize --apps "$plan"); do
+            branch="rightsize/$app-$env"  # one branch per app and environment, so an ignored pull request is updated
             git checkout -q -B "$branch" origin/main
             uv run berth rightsize --apply "$plan" --app "$app" --markdown "$(Agent.TempDirectory)/pr.md"
-            uv run berth render
-            git add apps rendered
-            git -c user.name="berth rightsizing" -c user.email=berth-rightsizing@contoso.com commit -qm "rightsize $app in $env"
-            git push -q -f origin "$branch"
-            open=$(az repos pr list --repository berth --source-branch "$branch" --status active --query '[].pullRequestId' -o tsv)
-            if [ -n "$open" ]; then
-              az repos pr update --id "$open" --description "$(cat "$(Agent.TempDirectory)/pr.md")" >/dev/null
-              echo "updated pull request $open for $app in $env"
-            else
-              az repos pr create --repository berth --source-branch "$branch" --target-branch main \
-                --title "rightsize $app in $env" --description "$(cat "$(Agent.TempDirectory)/pr.md")" \
-                --auto-complete true --delete-source-branch true
-            fi
+            uv run berth pr --branch "$branch" --title "rightsize $app in $env" --description-file "$(Agent.TempDirectory)/pr.md" --auto-complete
           done
         done
+    env:
+      GIT_AUTHOR_NAME: berth rightsizing
+      GIT_AUTHOR_EMAIL: berth-rightsizing@contoso.com
+      GIT_COMMITTER_NAME: berth rightsizing
+      GIT_COMMITTER_EMAIL: berth-rightsizing@contoso.com

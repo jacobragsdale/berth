@@ -115,6 +115,22 @@ def commit_files(root: Path, files: Mapping[str, str], *, parent: str | None, me
     return _git(root, "commit-tree", tree, *(["-p", parent] if parent is not None else []), "-m", message, env=identity).decode().strip()
 
 
+def commit_paths(root: Path, paths: Iterable[str], message: str) -> str | None:
+    """Commit whatever changed under `paths` and return the commit, or None if nothing did. The author is git's
+    usual one, which pipelines set with GIT_AUTHOR_NAME and GIT_AUTHOR_EMAIL."""
+    _git(root, "add", "--all", "--", *paths)
+    staged = subprocess.run(["git", "-C", str(root), "diff", "--cached", "--quiet"], capture_output=True, check=False, timeout=_TIMEOUT, env=_env())  # noqa: S607 - see _git
+    if staged.returncode == 0:
+        return None
+    _git(root, "commit", "--quiet", "--message", message)
+    return head_commit(root)
+
+
+def push_head(root: Path, remote: str, branch: str) -> None:
+    """Push HEAD to a branch of its own, replacing it: each bot run rebuilds its branch from main."""
+    _git(root, "push", "--quiet", "--force", remote, f"HEAD:refs/heads/{branch}")
+
+
 def push(root: Path, remote: str, commit: str, branch: str) -> None:
     """Push a commit to a branch. Not forced: if someone else moved the branch since it was read, this fails."""
     _git(root, "push", "--quiet", remote, f"{commit}:refs/heads/{branch}")

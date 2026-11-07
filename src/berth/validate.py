@@ -1,6 +1,10 @@
 """Checks that need more than one file: references between apps, platform menus, and what each orchestrator can express."""
 
+from collections.abc import Mapping
+
+from berth import yamlio
 from berth.fleet import MIRRORS_FILE, SOFTWARE_DIR, Fleet, Instance
+from berth.model import Platform
 from berth.render.controlm import controlm_when
 from berth.render.k8s import gateway_certificates
 from berth.render.software import releases, values
@@ -29,6 +33,27 @@ def problems(fleet: Fleet) -> list[str]:
                 except ValueError as error:
                     found.append(f"{where}: workflows.{name}: {error}")
     return found + _hostname_problems(fleet) + _software_problems(fleet) + _mirror_problems(fleet)
+
+
+PIPELINE_TARGETS = "pipelines/templates/targets.yml"
+
+
+def pipeline_problems(platform: Platform, tree: Mapping[str, str]) -> list[str]:
+    """Azure Pipelines loops over clusters and environments when it compiles a pipeline, before berth runs, so the
+    pipelines keep their own list in one template. It must say what platform.yaml says, in promotion order."""
+    text = tree.get(PIPELINE_TARGETS)
+    if text is None:
+        return []
+    try:
+        data = yamlio.load(text, source=PIPELINE_TARGETS)
+    except yamlio.YamlError as error:
+        return [str(error)]
+    variables = data.get("variables") if isinstance(data, dict) else None
+    if not isinstance(variables, dict):
+        return [f"{PIPELINE_TARGETS}: expected a mapping under variables"]
+    order = platform.promotion_order()
+    expected = {"clusters": ",".join(dict.fromkeys(platform.environments[env].cluster for env in order)), "environments": ",".join(order), "registry": platform.registry.split(".", 1)[0]}
+    return [f"{PIPELINE_TARGETS}: {name} is {variables.get(name)!r}, but platform/platform.yaml says {value!r}" for name, value in expected.items() if variables.get(name) != value]
 
 
 def _mirror_problems(fleet: Fleet) -> list[str]:

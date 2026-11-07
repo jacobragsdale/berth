@@ -24,7 +24,7 @@ steps:
     displayName: Unit tests
 
   - script: uv run berth check
-    displayName: Specs valid and render; schemas up to date
+    displayName: Specs valid and render; schemas and pipeline targets up to date
 
   - script: scripts/validate-rendered.sh
     displayName: Kubernetes schemas on everything rendered, for this Kubernetes version and the next

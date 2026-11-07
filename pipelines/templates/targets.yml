@@ -1,0 +1,7 @@
+# What the pipelines loop over, read when Azure Pipelines compiles them: the clusters in deploy order, the
+# environments in promotion order, and the registry's name. `berth check` fails if these disagree with
+# platform/platform.yaml, so a new cluster or environment cannot be added in one place and forgotten in the other.
+variables:
+  clusters: aks-qa,aks-prod
+  environments: dev,qa,prod
+  registry: contosoacr

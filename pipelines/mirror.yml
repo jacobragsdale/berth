@@ -3,7 +3,7 @@
 # which may change versions only, so dev updates merge once the checks pass; qa and prod are promoted by people.
 #
 # Not yet run in Azure DevOps. Needs a service connection berth-release for the release bot's identity, with
-# AcrPush on the registry (to import) and permission to open pull requests.
+# AcrPush on the registry (to import) and permission to open pull requests in this repository.
 trigger: none
 pr: none
 schedules:
@@ -16,9 +16,12 @@ schedules:
 pool:
   vmImage: ubuntu-24.04
 
+variables:
+  - template: templates/targets.yml
+
 steps:
   - checkout: self
-    persistCredentials: true
+    persistCredentials: true  # berth pr pushes a branch per release
   - template: templates/setup-uv.yml
   - script: uv run berth mirror --plan-out "$(Agent.TempDirectory)/mirror.json"
     displayName: Find newer upstream tags
@@ -30,26 +33,18 @@ steps:
       scriptLocation: inlineScript
       inlineScript: |
         set -euo pipefail
-        registry=contosoacr
-        uv run python -c "
-        import sys
-        from berth.mirror import Plan
-        for u in Plan.model_validate_json(open(sys.argv[1]).read()).updates:
-            for app in u.apps:
-                print(u.source, u.target, u.tag, u.env, app)
-        " "$(Agent.TempDirectory)/mirror.json" | while read -r source target tag env app; do
-          az acr import --name "$registry" --source "$source:$tag" --image "$target:$tag" --force
-          digest=$(az acr repository show --name "$registry" --image "$target:$tag" --query digest -o tsv)
-          branch="mirror/$app/$tag"
-          git checkout -q -B "$branch" origin/main
+        BERTH_ADO_TOKEN=$(az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --query accessToken -o tsv)
+        export BERTH_ADO_TOKEN
+        uv run berth mirror --rows "$(Agent.TempDirectory)/mirror.json" | while IFS=$'\t' read -r source target tag env app; do
+          az acr import --name "$(registry)" --source "$source:$tag" --image "$target:$tag" --force
+          digest=$(az acr repository show --name "$(registry)" --image "$target:$tag" --query digest -o tsv)
+          git checkout -q -B "mirror/$app/$tag" origin/main
           uv run berth release "$app" --env "$env" --version "$tag@$digest"
-          uv run berth render
-          git add apps rendered
-          git -c user.name="berth release" -c user.email=berth-release@contoso.com commit -qm "release $app $tag to $env (upstream $source)"
-          git push -q -f origin "$branch"
-          if [ -z "$(az repos pr list --repository berth --source-branch "$branch" --status active --query '[].pullRequestId' -o tsv)" ]; then
-            az repos pr create --repository berth --source-branch "$branch" --target-branch main \
-              --title "release $app $tag to $env" --description "New upstream tag $source:$tag, copied to $target." \
-              --auto-complete true --delete-source-branch true
-          fi
+          uv run berth pr --branch "mirror/$app/$tag" --title "release $app $tag to $env" --auto-complete \
+            --description "New upstream tag $source:$tag, copied to $target."
         done
+    env:
+      GIT_AUTHOR_NAME: berth release
+      GIT_AUTHOR_EMAIL: berth-release@contoso.com
+      GIT_COMMITTER_NAME: berth release
+      GIT_COMMITTER_EMAIL: berth-release@contoso.com

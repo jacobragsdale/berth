@@ -23,6 +23,7 @@ pool:
 
 variables:
   - group: berth-drift
+  - template: templates/targets.yml
 
 steps:
   - checkout: self
@@ -30,7 +31,7 @@ steps:
   - script: scripts/fetch-tools.sh
     displayName: Pinned kubectl
   # kubelogin borrows the Azure CLI's sign-in, which ends with the task, so each cluster is one task.
-  - ${{ each cluster in split('aks-qa,aks-prod', ',') }}:
+  - ${{ each cluster in split(variables.clusters, ',') }}:
       - task: AzureCLI@2
         displayName: berth drift on ${{ cluster }}
         condition: always()  # one cluster's failure must not hide the other's report
