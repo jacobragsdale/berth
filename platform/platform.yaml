@@ -15,11 +15,6 @@ rightsizing:
   price_per_vcpu_month: "25.00"
   price_per_gib_month: "3.50"
 
-# Entra groups whose members may change app namespaces with kubectl in an emergency (`edit` there, nothing else).
-# The daily drift report shows anything changed this way that git does not have.
-kubectl_writers:
-  - 77777777-7777-7777-7777-777777777777  # all developers
-
 # Individuals, not a team. Any one of them (other than the author) satisfies a platform-tier review.
 platform_approvers:
   - infra.lead@contoso.com
@@ -52,6 +47,9 @@ links:
   datadog-logs: https://app.datadoghq.com/logs?query=service%3A{service}%20env%3A{env}
   datadog-traces: https://app.datadoghq.com/apm/traces?query=service%3A{service}%20env%3A{env}
 
+# Each environment's break_glass_groups may change its app namespaces with kubectl in an emergency: workloads and
+# settings, never Secrets or a shell (the berth-break-glass role). The daily drift report shows what they changed.
+# Production's group is managed by Entra PIM: nobody is in it until they ask, and membership ends by itself.
 environments:
   dev:
     cluster: aks-qa
@@ -62,6 +60,7 @@ environments:
     otlp_endpoint: http://$(HOST_IP):4318  # the Datadog Agent's OTLP receiver on each node
     airflow: {namespace: airflow-dev, service_account: airflow-worker}
     controlm: {server: ctm-nonprod, connection_profile: K8S_DEV, timezone: America/New_York, agent_namespace: controlm, agent_service_account: controlm-agent}
+    break_glass_groups: [77777777-7777-7777-7777-777777777777]  # all developers
   qa:
     cluster: aks-qa
     key_vault: kv-contoso-qa
@@ -72,6 +71,7 @@ environments:
     otlp_endpoint: http://$(HOST_IP):4318
     airflow: {namespace: airflow-qa, service_account: airflow-worker}
     controlm: {server: ctm-nonprod, connection_profile: K8S_QA, timezone: America/New_York, agent_namespace: controlm, agent_service_account: controlm-agent}
+    break_glass_groups: [77777777-7777-7777-7777-777777777777]  # all developers
   prod:
     cluster: aks-prod
     key_vault: kv-contoso-prod
@@ -83,6 +83,7 @@ environments:
     otlp_endpoint: http://$(HOST_IP):4318
     airflow: {namespace: airflow, service_account: airflow-worker}
     controlm: {server: ctm-prod, connection_profile: K8S_PROD, timezone: America/New_York, agent_namespace: controlm, agent_service_account: controlm-agent}
+    break_glass_groups: [88888888-8888-8888-8888-888888888888]  # prod break-glass: Entra PIM, eligible for all developers
 
 # The menu of pod sizes. Apps pick a name; the platform owns what it means. Memory limit = request; no CPU limit.
 sizes:

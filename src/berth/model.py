@@ -298,6 +298,9 @@ class Proxy(Spec):
     no_proxy: tuple[Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9.*/:-]+$")], ...] = ()
 
 
+EntraObjectId = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")]
+
+
 class Environment(Spec):
     cluster: ClusterName
     key_vault: str
@@ -310,11 +313,14 @@ class Environment(Spec):
     otlp_endpoint: str | None = None
     airflow: AirflowTarget
     controlm: ControlMTarget
+    # Entra groups whose members may change this environment's app namespaces in an emergency (berth-break-glass:
+    # workloads and settings, not Secrets or a shell). For production, use groups managed by Entra PIM, so that
+    # membership is requested, approved, time-limited and logged instead of standing.
+    break_glass_groups: tuple[EntraObjectId, ...] = ()
 
 
 IPv4 = Annotated[str, StringConstraints(pattern=r"^(\d{1,3}\.){3}\d{1,3}$")]
 Cidr = Annotated[str, StringConstraints(pattern=r"^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$")]
-EntraObjectId = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")]
 
 
 class Cluster(Spec):
@@ -410,8 +416,6 @@ class Platform(Spec):
     # Identity whose pull requests may change sizes only: the weekly rightsizing bot.
     rightsizing_bot: Annotated[str, StringConstraints(min_length=1)] | None = None
     rightsizing: Rightsizing = Field(default_factory=Rightsizing)
-    # Entra groups whose members may change app namespaces with kubectl, for break-glass. They get `edit` there.
-    kubectl_writers: tuple[EntraObjectId, ...] = ()
     max_replicas_without_review: int = Field(ge=1)
     storage_class: str
     clusters: dict[ClusterName, Cluster] = Field(min_length=1)

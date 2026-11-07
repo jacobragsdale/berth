@@ -52,7 +52,7 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: berth-writers
+  name: berth-break-glass
   namespace: ledger-dev
   labels:
     app.kubernetes.io/name: ledger
@@ -62,7 +62,7 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: edit
+  name: berth-break-glass
 subjects:
   - apiGroup: rbac.authorization.k8s.io
     kind: Group

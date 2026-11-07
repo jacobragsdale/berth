@@ -178,12 +178,24 @@ def test_writable_paths_get_an_empty_directory_each() -> None:
     assert mounts["/data"] == "writable-1"
 
 
-def test_owners_read_and_the_writer_groups_edit_every_app_namespace() -> None:
-    docs = _docs_for(render(fleet()), "rendered/k8s/aks-qa/demo-dev/manifests.yaml")
-    bindings = {str(dig(doc, "metadata", "name")): doc for doc in docs if dig(doc, "kind") == "RoleBinding"}
-    assert dig(bindings["berth-owners"], "roleRef", "name") == "view"
-    assert dig(bindings["berth-writers"], "roleRef", "name") == "edit"
-    assert {str(dig(s, "kind")) for s in items(dig(bindings["berth-writers"], "subjects"))} == {"Group"}
+def test_owners_read_and_each_environments_break_glass_groups_may_change_workloads() -> None:
+    files = render(fleet())
+    groups = {}
+    for env in ("dev", "prod"):
+        cluster = "aks-prod" if env == "prod" else "aks-qa"
+        docs = _docs_for(files, f"rendered/k8s/{cluster}/demo-{env}/manifests.yaml")
+        bindings = {str(dig(doc, "metadata", "name")): doc for doc in docs if dig(doc, "kind") == "RoleBinding"}
+        assert dig(bindings["berth-owners"], "roleRef", "name") == "view"
+        assert dig(bindings["berth-break-glass"], "roleRef", "name") == "berth-break-glass"
+        groups[env] = {str(dig(s, "name")) for s in items(dig(bindings["berth-break-glass"], "subjects"))}
+    assert groups["dev"] != groups["prod"]  # production has its own group, managed by Entra PIM
+
+
+def test_the_break_glass_role_cannot_read_secrets_open_a_shell_or_grant_access() -> None:
+    (role,) = [doc for doc in _docs_for(render(fleet()), "rendered/k8s/aks-qa/_platform/platform.yaml") if dig(doc, "kind") == "ClusterRole" and dig(doc, "metadata", "name") == "berth-break-glass"]
+    resources = {str(resource) for rule in items(dig(role, "rules")) for resource in items(dig(rule, "resources"))}
+    assert {"deployments", "deployments/scale", "configmaps", "jobs"} <= resources
+    assert not resources & {"secrets", "pods/exec", "pods/attach", "pods/portforward", "roles", "rolebindings", "namespaces"}
 
 
 def test_platform_software_namespaces_are_not_app_namespaces() -> None:

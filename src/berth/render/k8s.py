@@ -15,6 +15,7 @@ MANAGED = {"app.kubernetes.io/managed-by": "berth"}
 PLATFORM_LABEL = f"{GROUP}/platform"
 POD_LAUNCHER = "berth-pod-launcher"
 JOB_LAUNCHER = "berth-job-launcher"
+BREAK_GLASS_ROLE = "berth-break-glass"
 GATEWAY = "berth"  # the GatewayClass and the one Gateway in each cluster
 PLATFORM_STORE = "berth-platform"
 PORT_NAME = "app"
@@ -72,9 +73,11 @@ def instance_objects(ctx: Context, callers: AbstractSet[str]) -> list[Doc]:
     docs.append({"apiVersion": "v1", "kind": "ServiceAccount", "metadata": _meta(ctx, ctx.app.name, annotations=sa_annotations)})
     # Owners can read everything in their namespaces except Secrets, including pod logs, with their own kubectl login.
     docs.append(_binding(ctx, "berth-owners", "view", [{"apiGroup": "rbac.authorization.k8s.io", "kind": "User", "name": owner} for owner in ctx.app.owners]))
-    if platform.kubectl_writers:
-        # Break-glass: these groups may change anything in the namespace. The daily drift report shows what they changed.
-        docs.append(_binding(ctx, "berth-writers", "edit", [{"apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": group} for group in platform.kubectl_writers]))
+    if environment.break_glass_groups:
+        # Break-glass: these groups may change workloads and settings here, but not read Secrets or open a shell.
+        # The daily drift report shows what they changed.
+        subjects: list[Doc] = [{"apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": group} for group in environment.break_glass_groups]
+        docs.append(_binding(ctx, BREAK_GLASS_ROLE, BREAK_GLASS_ROLE, subjects))
     if ctx.config_map is not None:
         docs.append({"apiVersion": "v1", "kind": "ConfigMap", "metadata": _meta(ctx, ctx.config_map), "data": dict(instance.config)})
     if ctx.files_map is not None:
@@ -360,9 +363,30 @@ def software_namespaces(cluster: str, software: Mapping[str, Software]) -> list[
     return [{"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": name, "labels": {PLATFORM_LABEL: "true"}, "annotations": dict(KEEP)}} for name in names]
 
 
+_READ = ["get", "list", "watch"]
+_CHANGE = ["update", "patch"]
+# What an emergency needs: scale, restart, change settings, images and routes, run a job, delete a stuck pod. Not
+# Secrets and not exec, attach or port-forward: each would reveal the app's secrets. Not RBAC, so nobody can widen it.
+_BREAK_GLASS_RULES: list[Doc] = [
+    {"apiGroups": [""], "resources": ["pods", "pods/log", "events", "endpoints", "persistentvolumeclaims", "serviceaccounts", "services", "configmaps"], "verbs": _READ},
+    {"apiGroups": [""], "resources": ["pods"], "verbs": ["delete"]},
+    {"apiGroups": [""], "resources": ["configmaps"], "verbs": ["create", "delete", *_CHANGE]},
+    {"apiGroups": [""], "resources": ["services"], "verbs": _CHANGE},
+    {"apiGroups": ["apps"], "resources": ["deployments", "deployments/scale", "replicasets", "statefulsets"], "verbs": _READ},
+    {"apiGroups": ["apps"], "resources": ["deployments", "deployments/scale"], "verbs": _CHANGE},
+    {"apiGroups": ["batch"], "resources": ["jobs", "cronjobs"], "verbs": [*_READ, "create", "delete", *_CHANGE]},
+    {"apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": [*_READ, *_CHANGE]},
+    {"apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": [*_READ, "delete", *_CHANGE]},
+    {"apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies"], "verbs": [*_READ, *_CHANGE]},
+    {"apiGroups": ["gateway.networking.k8s.io"], "resources": ["httproutes"], "verbs": [*_READ, *_CHANGE]},
+    {"apiGroups": ["external-secrets.io"], "resources": ["externalsecrets"], "verbs": [*_READ, "patch"]},  # annotate to refresh now
+]
+
+
 def cluster_objects(platform: Platform, cluster: str, software: Mapping[str, Software]) -> list[Doc]:
     """Objects shared by every app on one cluster. Applied after platform software, before any app."""
     docs: list[Doc] = [
+        {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole", "metadata": {"name": BREAK_GLASS_ROLE, "labels": MANAGED}, "rules": _BREAK_GLASS_RULES},
         {
             "apiVersion": "rbac.authorization.k8s.io/v1",
             "kind": "ClusterRole",

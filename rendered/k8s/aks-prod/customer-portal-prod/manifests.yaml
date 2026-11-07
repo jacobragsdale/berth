@@ -50,7 +50,7 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: berth-writers
+  name: berth-break-glass
   namespace: customer-portal-prod
   labels:
     app.kubernetes.io/name: customer-portal
@@ -60,11 +60,11 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: edit
+  name: berth-break-glass
 subjects:
   - apiGroup: rbac.authorization.k8s.io
     kind: Group
-    name: "77777777-7777-7777-7777-777777777777"
+    name: "88888888-8888-8888-8888-888888888888"
 ---
 apiVersion: v1
 kind: ConfigMap

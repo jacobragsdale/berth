@@ -151,6 +151,15 @@
         },
         "controlm": {
           "$ref": "#/$defs/ControlMTarget"
+        },
+        "break_glass_groups": {
+          "default": [],
+          "items": {
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "title": "Break Glass Groups",
+          "type": "array"
         }
       },
       "required": [
@@ -391,15 +400,6 @@
     },
     "rightsizing": {
       "$ref": "#/$defs/Rightsizing"
-    },
-    "kubectl_writers": {
-      "default": [],
-      "items": {
-        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-        "type": "string"
-      },
-      "title": "Kubectl Writers",
-      "type": "array"
     },
     "max_replicas_without_review": {
       "minimum": 1,
