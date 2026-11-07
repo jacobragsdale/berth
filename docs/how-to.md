@@ -174,7 +174,7 @@ You need permission to import into the registry (the `AcrPush` role on `contosoa
        writable: [/data]
    ```
 
-4. Add the image to `platform/mirrors.yaml`, so the mirror bot keeps it current. `berth check` refuses an image under `mirror/` without an entry:
+4. Add the image to `platform/mirrors.yaml`, so the mirror bot keeps it current, unless another app already mirrors the same image: then reuse its `target`. `berth check` refuses an image under `mirror/` without an entry. The entry's key is only a name. Like everything under `platform/`, the change needs a platform approver:
 
    ```yaml
    mirrors:
@@ -192,29 +192,46 @@ Databases holding data that matters are not run this way. Ask Azure or the DBA t
 
 ## How to keep a third-party image current
 
-The mirror bot (`pipelines/mirror.yml`) runs every morning. For each entry in `platform/mirrors.yaml` it finds the newest upstream tag on the entry's `track`, copies it into ACR, and opens a dev release pull request for every app that runs an older tag. The pull request comes from the release bot, so it merges once the checks pass. Promote it to qa and prod as you would your own releases.
+The mirror bot (`pipelines/mirror.yml`) runs every morning. For each entry in `platform/mirrors.yaml` it finds the newest upstream tag on the entry's `track`, copies it into ACR, and opens a dev release pull request for every app whose dev version is an older tag. "Older" compares the `X.Y.Z` numbers. A rebuild that an upstream pushes under the same tag is not noticed. The pull request comes from the release bot, which may change versions only, so in dev it merges once the checks pass, without a person. Promote it to qa and prod as you would your own releases.
 
-- **Follow a newer line:** change `track` from `"8.2"` to `"8.3"` in a pull request. That is a platform-tier change, because a minor version can change behaviour.
+- **Follow a newer line:** change `track` from `"8.2"` to `"8.3"` in a pull request, which needs a platform approver. Every app on that mirror then gets a dev release of the new line. There is no per-app opt-out: an app that must stay behind needs its own mirror entry with its own target.
 - **Follow a variant:** add `suffix: "-alpine"` to follow tags such as `8.2.11-alpine`. Release candidates and other suffixes are never taken.
-- **See what it would do:** `uv run berth mirror --plan-out plan.json` prints each pending update. It reads the public registries and changes nothing.
+- **See what it would do:** this reads the public registries and changes nothing in the repository:
+
+  ```sh
+  uv run berth mirror --plan-out plan.json
+  ```
+
+  It prints one line per pending update, and writes the same as JSON to `plan.json`:
+
+  ```text
+  docker.io/library/redis:8.2.11 -> mirror/redis:8.2.11, release to dev: rates-cache
+  ```
+
+Upstream images reach dev without a person reviewing them. The track limits how far they move, and only dev is automatic. If your registry scans images, as Microsoft Defender for Containers does, check its findings before promoting.
 
 ## How to respond to a rightsizing pull request
 
-Every Monday the rightsizing bot (`pipelines/rightsize.yml`) compares each service's and task's size with what it used in Datadog over the last 14 days. Where another size from the menu fits better, it opens one pull request per app per environment. The description gives each change, the reason, the observed CPU (95th percentile) and peak memory, and an estimated monthly saving.
+Every Monday the rightsizing bot (`pipelines/rightsize.yml`) compares each service's and task's size with what it used in Datadog over the last 14 days. Sizes are the menu in `platform/platform.yaml` (`xs` to `xxl`); each is a CPU and memory pair. The bot proposes the smallest size that holds the 95th percentile of CPU plus 25%, and the peak memory plus 30%. Where that differs from the current size, it opens one pull request per app per environment. The description gives each change, the reason, the observed CPU and peak memory, and an estimated monthly saving.
 
 - **In dev and qa** the pull request merges once the checks pass: the bot may change sizes only, and a size change there needs no approval.
-- **In prod** an owner approves it. Close it to keep the current size; the bot proposes again the next week if the numbers still say so.
-- **It never shrinks a workload that was killed for memory.** It proposes one size up instead.
-- **It leaves CPU alone for services that autoscale on CPU,** because the autoscaler's target is a percentage of the CPU request.
-- **It does nothing for a workload with less than seven days of data,** such as a new app.
+- **In prod** an owner approves it. If nobody does, it stays open, and the next week's run updates the same pull request rather than opening another. Close it to keep the current size; the bot proposes again if the numbers still say so. There is no way yet to stop proposals for one workload.
+- **Merging restarts the pods** with the new size, as a rolling update.
+- **A workload killed for memory** is never shrunk. The bot proposes one size up instead.
+- **A service that autoscales on CPU** (it has `autoscale:` in its spec) is only offered sizes with at least its current CPU, because the autoscaler's target is a percentage of the CPU request.
+- **No proposal for a workload with less than seven days of data,** such as a new app, or with no data at all, for example when a metric name does not match your Datadog account.
 
-To see what it would propose without opening anything, run it with Datadog keys in the environment:
+The window is 14 days by default. A batch job that peaks once a month needs a longer one: set `rightsizing.days` in `platform.yaml` (up to 60) to cover your longest cycle.
+
+To see what it would propose without opening anything, run it with Datadog keys in the environment. The platform team holds an API key and an application key with permission to read metrics; `DD_SITE` is your Datadog site, such as `datadoghq.com` or `datadoghq.eu`:
 
 ```sh
-DD_API_KEY=... DD_APP_KEY=... uv run berth rightsize --env prod --app payments-api --plan-out plan.json
+DD_API_KEY=... DD_APP_KEY=... DD_SITE=datadoghq.com uv run berth rightsize --env prod --app payments-api --plan-out plan.json
 ```
 
-The bot writes sizes into environment files, such as `services.api.size` in `prod.yaml`, or `workflows.<name>.tasks.<task>.size` for a task. You can set those by hand the same way.
+It prints one line per workload, such as `payments-api services.api: m -> s: smaller size fits the observed use with margin; p95 CPU 120m, peak memory 380Mi, over 14 days`, and writes the plan to `plan.json`.
+
+The bot writes sizes into environment files, such as `services.api.size` in `prod.yaml`, or `workflows.<name>.tasks.<task>.size` for a task. A size in an environment file wins over the one in `app.yaml` for that environment, so after the bot has set one, change it in the environment file rather than `app.yaml`. You can set those by hand the same way.
 
 ## How to change a setting
 
@@ -424,12 +441,11 @@ These have not been run against a real organisation. Treat each step as a checkl
 5. Create a variable group `berth-drift`, linked to Key Vault, holding `SLACK_WEBHOOK_URL`: an incoming webhook for the channel that should get the report.
 6. Create the pipeline `berth-drift` from `pipelines/drift.yml`. It runs at 13:00 UTC every day.
 7. For the rightsizing bot:
-   - create a variable group `berth-datadog` holding `DD_API_KEY`, `DD_APP_KEY` and `DD_SITE`;
-   - create a service connection `berth-rightsizing` for its identity, which must be `rightsizing_bot` in `platform.yaml` and may open pull requests;
-   - create the pipeline `berth-rightsize` from `pipelines/rightsize.yml`, which runs every Monday at 12:00 UTC.
-
-   First check the Datadog metric names in `platform.yaml`'s `rightsizing` against your account: run `berth rightsize` for one app and compare its numbers with Datadog's own graphs.
-8. For the mirror bot: give the `berth-release` connection's identity `AcrPush` on the registry, and create the pipeline `berth-mirror` from `pipelines/mirror.yml`, which runs every day at 06:00 UTC.
+   1. Check the Datadog metric names in `platform.yaml`'s `rightsizing` against your account first: run `berth rightsize` for one app, as in [How to respond to a rightsizing pull request](#how-to-respond-to-a-rightsizing-pull-request), and compare its numbers with Datadog's own graphs. With wrong names it proposes nothing; with names that measure something else it proposes wrong sizes, which merge by themselves in dev and qa.
+   2. Create a variable group `berth-datadog`, linked to Key Vault, holding `DD_API_KEY`, `DD_APP_KEY` and `DD_SITE`.
+   3. Create an Azure Resource Manager service connection `berth-rightsizing`, with workload identity federation, for the bot's own identity. Give that identity **Contribute**, **Create branch** and **Contribute to pull requests** on the repository, and set `rightsizing_bot` in `platform.yaml` to its unique name, as it appears in a pull request's `createdBy.uniqueName`.
+   4. Create the pipeline `berth-rightsize` from `pipelines/rightsize.yml`. It runs every Monday at 12:00 UTC.
+8. For the mirror bot, use the release bot's connection `berth-release`, which the app release template also uses. Create it as in step 7.3 for the release bot's identity, `release_bot` in `platform.yaml`, and also give that identity `AcrPush` on the registry. Then create the pipeline `berth-mirror` from `pipelines/mirror.yml`, which runs every day at 06:00 UTC. Public upstream registries need no credentials.
 9. Grant each variable group pipeline permission to the pipeline that uses it only.
 
 ## How to set up the gate in Azure DevOps

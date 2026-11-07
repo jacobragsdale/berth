@@ -47,7 +47,9 @@ steps:
           git add apps rendered
           git -c user.name="berth release" -c user.email=berth-release@contoso.com commit -qm "release $app $tag to $env (upstream $source)"
           git push -q -f origin "$branch"
-          az repos pr create --repository berth --source-branch "$branch" --target-branch main \
-            --title "release $app $tag to $env" --description "New upstream tag $source:$tag, copied to $target." \
-            --auto-complete true --delete-source-branch true
+          if [ -z "$(az repos pr list --repository berth --source-branch "$branch" --status active --query '[].pullRequestId' -o tsv)" ]; then
+            az repos pr create --repository berth --source-branch "$branch" --target-branch main \
+              --title "release $app $tag to $env" --description "New upstream tag $source:$tag, copied to $target." \
+              --auto-complete true --delete-source-branch true
+          fi
         done

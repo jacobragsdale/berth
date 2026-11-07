@@ -5,7 +5,8 @@
 #
 # Not yet run in Azure DevOps. Needs a variable group berth-datadog (DD_API_KEY, DD_APP_KEY, DD_SITE; Key Vault-
 # linked), and a service connection berth-rightsizing for the bot's identity, which opens the pull requests.
-# The Datadog metric names in platform.yaml rightsizing are defaults: check them against your account first.
+# The Datadog metric names in platform.yaml rightsizing are defaults: check them against your account before
+# enabling the schedule. With no data for a workload, the bot proposes nothing for it.
 trigger: none
 pr: none
 schedules:
@@ -43,15 +44,21 @@ steps:
         for env in dev qa prod; do
           plan="$(Agent.TempDirectory)/rightsize-$env.json"
           for app in $(uv run python -c "import sys; from berth.rightsize import Plan; print(' '.join(Plan.model_validate_json(open(sys.argv[1]).read()).apps()))" "$plan"); do
-            branch="rightsize/$app-$env-$(date -u +%Y%m%d)"
+            branch="rightsize/$app-$env"  # one branch per app and environment, so an ignored pull request is updated, not duplicated
             git checkout -q -B "$branch" origin/main
             uv run berth rightsize --apply "$plan" --app "$app" --markdown "$(Agent.TempDirectory)/pr.md"
             uv run berth render
             git add apps rendered
             git -c user.name="berth rightsizing" -c user.email=berth-rightsizing@contoso.com commit -qm "rightsize $app in $env"
             git push -q -f origin "$branch"
-            az repos pr create --repository berth --source-branch "$branch" --target-branch main \
-              --title "rightsize $app in $env" --description "$(cat "$(Agent.TempDirectory)/pr.md")" \
-              --auto-complete true --delete-source-branch true
+            open=$(az repos pr list --repository berth --source-branch "$branch" --status active --query '[].pullRequestId' -o tsv)
+            if [ -n "$open" ]; then
+              az repos pr update --id "$open" --description "$(cat "$(Agent.TempDirectory)/pr.md")" >/dev/null
+              echo "updated pull request $open for $app in $env"
+            else
+              az repos pr create --repository berth --source-branch "$branch" --target-branch main \
+                --title "rightsize $app in $env" --description "$(cat "$(Agent.TempDirectory)/pr.md")" \
+                --auto-complete true --delete-source-branch true
+            fi
           done
         done
