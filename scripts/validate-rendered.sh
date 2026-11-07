@@ -10,6 +10,7 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
 uv run python -I scripts/extract_workloads.py rendered "$WORK/scheduled"
+mv "$WORK/scheduled/values.yaml" "$WORK/values.yaml"
 
 "$BIN/kubeconform" -strict -summary -kubernetes-version 1.33.0 \
   -schema-location default \
@@ -18,7 +19,7 @@ uv run python -I scripts/extract_workloads.py rendered "$WORK/scheduled"
 
 find rendered/k8s -name manifests.yaml -exec cat {} + > "$WORK/all.yaml"
 for f in "$WORK"/scheduled/*.yaml; do printf -- '---\n' >> "$WORK/all.yaml"; cat "$f" >> "$WORK/all.yaml"; done
-result=$("$BIN/kyverno" apply platform/admission/*.yaml --resource "$WORK/all.yaml" 2>&1 | grep -v '^Warning:' )
+result=$("$BIN/kyverno" apply platform/admission/*.yaml --resource "$WORK/all.yaml" --values-file "$WORK/values.yaml" 2>&1 | grep -v '^Warning:' )
 echo "$result" | tail -1
 if ! echo "$result" | grep -q 'fail: 0, warn: 0, error: 0'; then
   echo "$result"

@@ -7,7 +7,8 @@ metadata:
 spec:
   validationActions: [Deny]
   matchConstraints:
-    objectSelector:
+    # By the namespace's label, not the object's: an override could strip a pod's labels, never its namespace's.
+    namespaceSelector:
       matchLabels: {app.kubernetes.io/managed-by: berth}
     resourceRules:
       - {apiGroups: [""], apiVersions: [v1], operations: [CREATE, UPDATE], resources: [pods]}

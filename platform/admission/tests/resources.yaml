@@ -25,6 +25,34 @@ spec:
           image: docker.io/library/nginx:1.29@sha256:0000000000000000000000000000000000000000000000000000000000000000
           resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {memory: 512Mi}}
 ---
+# An override that removed berth's labels: still in an app namespace, so still checked.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: labels-stripped, namespace: demo-dev}
+spec:
+  selector: {matchLabels: {app: demo}}
+  template:
+    metadata: {labels: {app: demo}}
+    spec:
+      containers:
+        - name: main
+          image: docker.io/library/nginx:1.29
+          resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {memory: 512Mi}}
+---
+# Platform components outside app namespaces are not berth's to check.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: system-workload, namespace: kube-system}
+spec:
+  selector: {matchLabels: {app: sys}}
+  template:
+    metadata: {labels: {app: sys}}
+    spec:
+      containers:
+        - name: main
+          image: mcr.microsoft.com/oss/kubernetes/coredns:v1.12.1
+          resources: {requests: {cpu: 100m, memory: 70Mi}, limits: {memory: 170Mi}}
+---
 apiVersion: batch/v1
 kind: CronJob
 metadata: {name: tag-only, namespace: demo-dev, labels: {app.kubernetes.io/managed-by: berth}}

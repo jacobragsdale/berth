@@ -4,9 +4,11 @@ metadata:
   name: berth-admission
 policies: [../images.yaml, ../resources.yaml, ../secrets.yaml, ../ownership.yaml]
 resources: [resources.yaml]
+variables: values.yaml
 results:
   - {isValidatingPolicy: true, policy: berth-images, kind: Deployment, resources: [good-api, no-memory-limit], result: pass}
-  - {isValidatingPolicy: true, policy: berth-images, kind: Deployment, resources: [public-registry], result: fail}
+  - {isValidatingPolicy: true, policy: berth-images, kind: Deployment, resources: [public-registry, labels-stripped], result: fail}
+  - {isValidatingPolicy: true, policy: berth-images, kind: Deployment, resources: [system-workload], result: skip}
   - {isValidatingPolicy: true, policy: berth-images, kind: CronJob, resources: [tag-only], result: fail}
   - {isValidatingPolicy: true, policy: berth-resources, kind: Deployment, resources: [good-api, public-registry], result: pass}
   - {isValidatingPolicy: true, policy: berth-resources, kind: Deployment, resources: [no-memory-limit], result: fail}
