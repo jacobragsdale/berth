@@ -12,11 +12,11 @@ import json
 from collections.abc import Mapping, Sequence
 
 from berth.model import Platform
-from berth.render.pod import LABEL_APP, LABEL_ENV, Doc
+from berth.render.pod import LABEL_APP, LABEL_ENV, MANAGED, Doc
 
 API = "admissionregistration.k8s.io/v1"
 WRITES = ["CREATE", "UPDATE"]
-APPS = {"app.kubernetes.io/managed-by": "berth"}
+APPS = MANAGED  # policies apply in namespaces labelled as berth's
 
 # Where each kind keeps its pod spec. Deployments, Jobs and friends share a shape; CronJobs nest one level deeper.
 _SHAPES = {

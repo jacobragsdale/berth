@@ -32,7 +32,7 @@ def _check[T](adapter: TypeAdapter[T], value: object, what: str) -> T:
 def release(root: Path, app: str, env: str, version: str) -> Path:
     checked = _check(TypeAdapter(Version), version, "version")
     path = _env_file(root, app, env)
-    path.write_text(yamlio.set_top_level(path.read_text(), "version", checked, source=str(path)))
+    path.write_text(yamlio.set_path(path.read_text(), ("version",), checked, source=str(path)))
     return path
 
 
