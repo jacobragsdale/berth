@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import difflib
 import json
 import sys
 from collections.abc import Callable, Sequence
@@ -17,7 +18,8 @@ from berth.fleet import Fleet, LoadError, load
 from berth.kube import KubeError
 from berth.model import App, EnvFile, Mirrors, Platform, Software
 from berth.registry import RegistryError
-from berth.render import ROOT, render, stale
+from berth.render import ROOT, render
+from berth.render.k8s import RenderError
 from berth.review import Decision, Proposal, Requirement, Votes, classify, decide, requirements
 
 SCHEMAS = {
@@ -37,7 +39,14 @@ class Check:
 @dataclass(frozen=True)
 class Render:
     root: Path
-    check: bool
+    out: Path
+
+
+@dataclass(frozen=True)
+class RenderedDiff:
+    root: Path
+    base: str
+    out: Path | None
 
 
 @dataclass(frozen=True)
@@ -100,16 +109,19 @@ class Images:
     base: str | None
 
 
-type Command = Check | Render | Review | Gate | Release | Promote | New | Schema | Explain | Images | cluster_cli.Command | bots_cli.Command
+type Command = Check | Render | RenderedDiff | Review | Gate | Release | Promote | New | Schema | Explain | Images | cluster_cli.Command | bots_cli.Command
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="berth", description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(), help="repository root (default: current directory)")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("check", help="validate every spec, and fail if rendered/ or the schemas are stale")
-    render_cmd = sub.add_parser("render", help="write rendered/ from the specs")
-    render_cmd.add_argument("--check", action="store_true", help="only report stale files")
+    sub.add_parser("check", help="validate and render every spec, and fail if the schemas are stale")
+    render_cmd = sub.add_parser("render", help="write the rendered tree, to read it (it is never committed)")
+    render_cmd.add_argument("--out", type=Path, help=f"directory to write (default: {ROOT}/ in the repository, which git ignores)")
+    diff_cmd = sub.add_parser("diff", help="show what the working tree's changes do to the rendered output, against a base ref")
+    diff_cmd.add_argument("--base", default="main")
+    diff_cmd.add_argument("--out", type=Path, help="write the full diff here and print only the summary")
     review_cmd = sub.add_parser("review", help="show who must approve the working tree's changes against a base ref")
     review_cmd.add_argument("--base", default="main")
     review_cmd.add_argument("--author", required=True, help="the identity opening the pull request")
@@ -148,7 +160,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def parse(argv: Sequence[str]) -> Command:  # noqa: PLR0911 - one return per command keeps the match exhaustive
+def parse(argv: Sequence[str]) -> Command:  # noqa: PLR0911, PLR0912 - one return per command keeps the match exhaustive
     parser = _parser()
     ns = parser.parse_args(argv)
     root = Path(ns.root)
@@ -160,7 +172,9 @@ def parse(argv: Sequence[str]) -> Command:  # noqa: PLR0911 - one return per com
         case "check":
             return Check(root)
         case "render":
-            return Render(root, check=ns.check)
+            return Render(root, ns.out if ns.out is not None else root / ROOT)
+        case "diff":
+            return RenderedDiff(root, ns.base, ns.out)
         case "review":
             return Review(root, ns.base, ns.author.lower(), frozenset(name.lower() for name in ns.approve), frozenset(name.lower() for name in ns.reject), frozenset(ns.label), ns.markdown)
         case "gate":
@@ -196,13 +210,19 @@ def _load_worktree(root: Path, out: TextIO) -> tuple[Fleet, dict[str, str]] | No
     return fleet, tree
 
 
-def _problems(fleet: Fleet, tree: dict[str, str]) -> list[str]:
-    """Everything `berth check` enforces. The gate re-runs it with trusted code, because rendered/ is what deploys."""
+def rendered(fleet: Fleet) -> tuple[dict[str, str] | None, list[str]]:
+    """The rendered tree, or the problems that stop it: cross-file rules, then anything that fails to render.
+
+    This is what the gate checks with main's berth. It does not compare anything committed, because nothing rendered
+    is committed: a change to berth's own renderer is judged on its code, not on output main's code cannot produce.
+    """
     problems = validate.problems(fleet)
-    if not problems:
-        problems += [f"{path}: stale; run `berth render`" for path in stale(render(fleet), tree)]
-        problems += [f"{path}: stale; run `berth schema`" for path, text in _schemas().items() if tree.get(path) != text]
-    return problems
+    if problems:
+        return None, problems
+    try:
+        return render(fleet), []
+    except RenderError as error:
+        return None, str(error).splitlines()
 
 
 def _check(cmd: Check, out: TextIO) -> int:
@@ -210,39 +230,80 @@ def _check(cmd: Check, out: TextIO) -> int:
     if loaded is None:
         return 1
     fleet, tree = loaded
-    problems = _problems(fleet, tree)
+    _, problems = rendered(fleet)
+    problems += [f"{path}: stale; run `berth schema`" for path, text in _schemas().items() if tree.get(path) != text]
     out.writelines(f"{problem}\n" for problem in problems)
     if not problems:
         out.write(f"ok: {len(fleet.apps)} apps, {sum(len(app.envs) for app in fleet.apps.values())} app environments\n")
     return 1 if problems else 0
 
 
+_RENDERED_README_START = "# Rendered output"
+
+
 def _render(cmd: Render, out: TextIO) -> int:
     loaded = _load_worktree(cmd.root, out)
     if loaded is None:
         return 1
-    fleet, tree = loaded
-    problems = validate.problems(fleet)
-    if problems:
+    files, problems = rendered(loaded[0])
+    if files is None:
         out.writelines(f"{problem}\n" for problem in problems)
         return 1
-    expected = render(fleet)
-    changed = stale(expected, tree)
-    if cmd.check:
-        out.writelines(f"{path}: stale\n" for path in changed)
-        return 1 if changed else 0
+    target = cmd.out
+    existing = {path.relative_to(target).as_posix() for path in target.rglob("*") if path.is_file()} if target.is_dir() else set()
+    readme = target / "README.md"
+    if existing and not (readme.is_file() and readme.read_text().startswith(_RENDERED_README_START)):
+        out.write(f"error: {target} is not empty and is not a rendered tree; choose another --out\n")
+        return 1
+    changed = sorted(path for path in set(files) | existing if path not in files or path not in existing or (target / path).read_text() != files[path])
     for path in changed:
-        target = cmd.root / path
-        if path in expected:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(expected[path])
+        if path in files:
+            (target / path).parent.mkdir(parents=True, exist_ok=True)
+            (target / path).write_text(files[path])
         else:
-            target.unlink()
-    for directory in sorted((cmd.root / ROOT).rglob("*"), reverse=True):
+            (target / path).unlink()
+    for directory in sorted(target.rglob("*"), reverse=True):
         if directory.is_dir() and not any(directory.iterdir()):
             directory.rmdir()
-    out.write(f"rendered {len(expected)} files ({len(changed)} changed)\n")
+    out.write(f"rendered {len(files)} files into {target}/ ({len(changed)} changed)\n")
     return 0
+
+
+def _unified(path: str, before: dict[str, str], after: dict[str, str]) -> str:
+    old, new = before.get(path, ""), after.get(path, "")
+    lines = difflib.unified_diff(old.splitlines(keepends=True), new.splitlines(keepends=True), f"a/{path}" if path in before else "/dev/null", f"b/{path}" if path in after else "/dev/null")
+    return "".join(line if line.endswith("\n") else line + "\n" for line in lines)
+
+
+def _rendered_diff(cmd: RenderedDiff, out: TextIO) -> int:
+    loaded = _load_worktree(cmd.root, out)
+    if loaded is None:
+        return 1
+    head, problems = rendered(loaded[0])
+    if head is None:
+        out.writelines(f"{problem}\n" for problem in problems)
+        return 1
+    try:
+        base = render(load(gitio.at_ref(cmd.root, cmd.base)))
+    except (LoadError, RenderError):
+        base = {}  # a base that does not render (before berth existed, say): everything is new
+    chunks = {path: _unified(path, base, head) for path in gitio.changed_paths(base, head)}
+    if cmd.out is None:
+        out.write("".join(chunks.values()))
+        return 0
+    cmd.out.write_text("".join(chunks.values()))
+    count = "1 rendered file changes" if len(chunks) == 1 else f"{len(chunks)} rendered files change"
+    out.write(f"{count} against {cmd.base}; the full diff is in {cmd.out}\n")
+    for path, chunk in chunks.items():
+        lines = chunk.splitlines()[2:]
+        out.write(f"  +{sum(line.startswith('+') for line in lines)} -{sum(line.startswith('-') for line in lines)}  {path}\n")
+    return 0
+
+
+# A change to berth itself is judged by main's berth, which renders the old way. Its rendered effect comes from the
+# pull request's own build instead (`berth diff`, attached to the run).
+_CODE_PATHS = ("src/", "scripts/", "pyproject.toml", "uv.lock")
+_CODE_NOTE = "this changes berth itself: main's berth rendered the list above; the pull request build attaches what the new code renders"
 
 
 @dataclass(frozen=True)
@@ -251,10 +312,11 @@ class _Reviewed:
     reqs: list[Requirement]
     affected: dict[str, set[str]]
     problems: list[str]
+    notes: tuple[str, ...] = ()
 
     def decide(self, proposal: Proposal, now: datetime) -> Decision:
         if self.problems:
-            return Decision("failed", ("berth check fails: fix the specs or run `berth render`", *self.problems[:20]))
+            return Decision("failed", ("berth check fails: fix the specs", *self.problems[:20]))
         return decide(self.reqs, proposal, self.base.platform, now)
 
 
@@ -278,7 +340,13 @@ def _reviewed(root: Path, base_ref: str, out: TextIO) -> _Reviewed | None:
     }
     history = gitio.version_history(root, base_ref, sources)
     findings = [classify(change, platform, policy, history) for change in changes]
-    return _Reviewed(base, requirements(findings, base, head), diff.affected_apps(base, head, changed), _problems(head, head_tree))
+    head_files, problems = rendered(head)
+    affected: dict[str, set[str]] = {}
+    if head_files is not None:
+        with contextlib.suppress(RenderError):  # main renders on main; if it ever does not, there is nothing to compare
+            affected = diff.affected_apps(base, head, gitio.changed_paths(render(base), head_files))
+    notes = (_CODE_NOTE,) if any(path.startswith(_CODE_PATHS) for path in changed) else ()
+    return _Reviewed(base, requirements(findings, base, head), affected, problems, notes)
 
 
 def _review(cmd: Review, out: TextIO, now: datetime) -> int:
@@ -286,9 +354,9 @@ def _review(cmd: Review, out: TextIO, now: datetime) -> int:
     if reviewed is None:
         return 1
     decision = reviewed.decide(Proposal(cmd.author, Votes(cmd.approved, cmd.rejected), cmd.labels), now)
-    out.write(report.text(reviewed.reqs, reviewed.affected, decision))
+    out.write(report.text(reviewed.reqs, reviewed.affected, decision, reviewed.notes))
     if cmd.markdown is not None:
-        cmd.markdown.write_text(report.markdown(reviewed.reqs, reviewed.affected, decision))
+        cmd.markdown.write_text(report.markdown(reviewed.reqs, reviewed.affected, decision, reviewed.notes))
     return 0
 
 
@@ -302,9 +370,9 @@ def _gate(cmd: Gate, out: TextIO, now: datetime) -> int:
         return 1
     decision = reviewed.decide(pr.proposal, now)
     ado.post_status(cmd.pr, decision, cmd.target_url)
-    out.write(report.text(reviewed.reqs, reviewed.affected, decision))
+    out.write(report.text(reviewed.reqs, reviewed.affected, decision, reviewed.notes))
     if cmd.summary is not None:
-        cmd.summary.write_text(report.markdown(reviewed.reqs, reviewed.affected, decision))
+        cmd.summary.write_text(report.markdown(reviewed.reqs, reviewed.affected, decision, reviewed.notes))
     return 0
 
 
@@ -332,16 +400,16 @@ def _platform_of(root: Path, out: TextIO) -> Fleet | None:
 
 
 def _checked(root: Path, out: TextIO) -> tuple[Fleet, dict[str, str]] | None:
-    """The worktree, only if `berth check` passes: nothing stale or invalid ever reaches a cluster."""
+    """The worktree's fleet and rendered tree, only if it validates and renders: nothing invalid reaches a cluster."""
     loaded = _load_worktree(root, out)
     if loaded is None:
         return None
-    problems = _problems(*loaded)
-    if problems:
+    files, problems = rendered(loaded[0])
+    if files is None:
         out.writelines(f"{problem}\n" for problem in problems)
         out.write("refusing to touch the cluster until `berth check` passes\n")
         return None
-    return loaded
+    return loaded[0], files
 
 
 def run(cmd: Command, out: TextIO, now: datetime) -> int:  # noqa: PLR0911, PLR0912, C901 - one branch per command, checked by assert_never
@@ -351,20 +419,22 @@ def run(cmd: Command, out: TextIO, now: datetime) -> int:  # noqa: PLR0911, PLR0
                 return _check(cmd, out)
             case Render():
                 return _render(cmd, out)
+            case RenderedDiff():
+                return _rendered_diff(cmd, out)
             case Review():
                 return _review(cmd, out, now)
             case Gate():
                 return _gate(cmd, out, now)
             case Release():
                 path = edit.release(cmd.root, cmd.app, cmd.env, cmd.version)
-                out.write(f"{path.relative_to(cmd.root)}: version {cmd.version}; run `berth render`\n")
+                out.write(f"{path.relative_to(cmd.root)}: version {cmd.version}\n")
                 return 0
             case Promote():
                 fleet = _platform_of(cmd.root, out)
                 if fleet is None:
                     return 1
                 path, version = edit.promote(cmd.root, fleet.platform, cmd.app, cmd.env)
-                out.write(f"{path.relative_to(cmd.root)}: version {version}; run `berth render`\n")
+                out.write(f"{path.relative_to(cmd.root)}: version {version}\n")
                 return 0
             case New():
                 paths = edit.new_app(cmd.root, cmd.app)
@@ -378,7 +448,7 @@ def run(cmd: Command, out: TextIO, now: datetime) -> int:  # noqa: PLR0911, PLR0
                 return 0 if fleet.instance(cmd.app, cmd.env) is not None else 1
             case Images():
                 return _list_images(cmd, out)
-            case cluster_cli.Deploy() | cluster_cli.Drift() | cluster_cli.BreakGlassStart() | cluster_cli.BreakGlassEnd():
+            case cluster_cli.Deploy() | cluster_cli.Drift() | cluster_cli.BreakGlassStart() | cluster_cli.BreakGlassEnd() | cluster_cli.Publish():
                 return cluster_cli.run(cmd, _platform_of, _checked, out, now)
             case bots_cli.RightsizePlan() | bots_cli.RightsizeApply() | bots_cli.MirrorPlan():
                 return bots_cli.run(cmd, _platform_of, out, now)

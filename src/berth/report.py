@@ -19,7 +19,7 @@ def _show(value: object) -> str:
     return text if len(text) <= _WIDTH else text[: _WIDTH - 3] + "..."
 
 
-def text(reqs: list[Requirement], affected: Mapping[str, AbstractSet[str]], decision: Decision) -> str:
+def text(reqs: list[Requirement], affected: Mapping[str, AbstractSet[str]], decision: Decision, notes: tuple[str, ...] = ()) -> str:
     lines: list[str] = []
     for req in reqs:
         lines.append(f"{req.app or 'platform files'}: {req.tier.name.lower()} review")
@@ -30,14 +30,16 @@ def text(reqs: list[Requirement], affected: Mapping[str, AbstractSet[str]], deci
     if unexplained:
         lines.append("rendered output changes without a spec change (owners are notified, not asked):")
         lines.extend(f"  {app}: {', '.join(sorted(envs))}" for app, envs in sorted(unexplained.items()))
+    lines.extend(f"note: {note}" for note in notes)
     lines.append(f"gate: {decision.state}")
     lines.extend(f"  {line}" for line in decision.lines)
     return "\n".join(lines) + "\n"
 
 
-def markdown(reqs: list[Requirement], affected: Mapping[str, AbstractSet[str]], decision: Decision) -> str:
+def markdown(reqs: list[Requirement], affected: Mapping[str, AbstractSet[str]], decision: Decision, notes: tuple[str, ...] = ()) -> str:
     out = [f"## berth review: {decision.state}", ""]
     out.extend(f"- {line}" for line in decision.lines)
+    out.extend(f"- Note: {note}" for note in notes)
     for req in reqs:
         out += ["", f"### {req.app or 'platform files'} ({req.tier.name.lower()})", "", "| env | path | change | tier | why |", "|---|---|---|---|---|"]
         out.extend(f"| {f.change.env or '*'} | `{show(f.change.path)}` | {_show(f.change.before)} → {_show(f.change.after)} | {f.tier.name.lower()} | {f.reason} |" for f in req.findings)

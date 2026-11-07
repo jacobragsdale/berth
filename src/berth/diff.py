@@ -5,7 +5,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from berth.fleet import Fleet, Instance
-from berth.render import ROOT, namespace_of
+from berth.render import namespace_of
 
 APP_LEVEL = ("description", "owners", "source", "image")
 ADDED = "added"
@@ -95,25 +95,28 @@ def spec_changes(base: Fleet, head: Fleet, changed_files: Iterable[str]) -> list
     for app in sorted({app for path in files if (app := app_of(path)) is not None}):
         changes.extend(_app_changes(base, head, app, files))
     changes.extend(_new_callers(base, head))
-    changes.extend(Change(None, None, ("platform_file", path), None, path) for path in files if app_of(path) is None and not path.startswith(f"{ROOT}/"))
+    changes.extend(Change(None, None, ("platform_file", path), None, path) for path in files if app_of(path) is None)
     return changes
 
 
-def affected_apps(base: Fleet, head: Fleet, changed_files: Iterable[str]) -> dict[str, set[str]]:
-    """Apps whose rendered output changed, by app, with the environments affected. Owners hear about these."""
+def affected_apps(base: Fleet, head: Fleet, changed_rendered: Iterable[str]) -> dict[str, set[str]]:
+    """Apps whose rendered output changed, by app, with the environments affected. Owners hear about these.
+
+    `changed_rendered` are paths in the rendered tree, as `berth.render.render` names them.
+    """
     namespaces: dict[str, tuple[str, str]] = {}
     for fleet in (base, head):
         for instance in fleet.instances():
             namespaces[instance.namespace] = (instance.app, instance.env)
     affected: dict[str, set[str]] = {}
-    for path in changed_files:
+    for path in changed_rendered:
         found = namespace_of(path)
         if found is not None and found[1] in namespaces:
             app, env = namespaces[found[1]]
             affected.setdefault(app, set()).add(env)
             continue
         parts = path.split("/")
-        if len(parts) == 4 and parts[0] == ROOT and parts[1] in {"airflow", "controlm"}:  # noqa: PLR2004 - rendered/<scheduler>/<env>/<file>
-            app = parts[3].split("__", 1)[0].removesuffix(".json")
-            affected.setdefault(app, set()).add(parts[2])
+        if len(parts) == 3 and parts[0] in {"airflow", "controlm"}:  # noqa: PLR2004 - <scheduler>/<env>/<file>
+            app = parts[2].split("__", 1)[0].removesuffix(".json")
+            affected.setdefault(app, set()).add(parts[1])
     return affected

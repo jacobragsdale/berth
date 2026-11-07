@@ -1,21 +1,26 @@
-"""Where a cluster differs from git, and how to say so. Pure: `berth.cli` gathers the facts with `berth.kube`.
+"""Where a cluster differs from git, and how to say so. Pure: `berth.operate` gathers the facts with `berth.kube`.
 
-Three kinds of difference are reported for each app namespace:
-- changed: an object berth renders differs from git, found with a server-side diff;
-- unmanaged: an object nobody rendered, such as a ConfigMap made by hand during an incident;
+For every app namespace the report says:
+- not deployed: git renders something the last successful deploy did not apply;
+- changed: an object differs from git, found with a server-side dry run of git's version;
+- missing: git renders an object the cluster does not have;
+- by hand: fields a person set, read from the API server's record of who set each field;
+- unmanaged: objects nobody rendered, such as a ConfigMap made during an incident;
 - not in git: a berth namespace on the cluster whose app or environment file has been removed.
 """
 
+import difflib
 import json
-import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
+from berth import yamlio
 from berth.kube import FIELD_MANAGER, STAMP_MANAGER, ObjectRef
-from berth.render.k8s import GROUP, KEEP, MANAGED
+from berth.render.k8s import KEEP, VERSIONED
+from berth.render.pod import GROUP, MANAGED
 
-BREAK_GLASS = f"{GROUP}/break-glass"
+BREAK_GLASS = "berth-break-glass"  # the ConfigMap in an app namespace that marks it as changed by hand on purpose
 BREAK_GLASS_MANAGER = "berth-break-glass"
 # Field managers whose changes are expected: berth itself, and Kubernetes' controllers (an autoscaler setting replicas,
 # a Deployment's revision annotation). Anyone else, such as kubectl-edit, kubectl-set or kubectl-scale, is a person.
@@ -26,6 +31,11 @@ _HARMLESS = frozenset({".spec.template.metadata.annotations.kubectl.kubernetes.i
 _PATCHABLE = frozenset({"ConfigMap", "ServiceAccount", "PersistentVolumeClaim", "Service", "Deployment", "CronJob", "HorizontalPodAutoscaler", "PodDisruptionBudget", "NetworkPolicy", "RoleBinding"})
 DEPLOYED_COMMIT = f"{GROUP}/deployed-commit"
 DEPLOYED_AT = f"{GROUP}/deployed-at"
+DEPLOYED_DIGEST = f"{GROUP}/deployed-digest"  # a hash of the manifests last applied in full, rollouts included
+SUPERSEDED_AT = f"{GROUP}/superseded-at"  # when a versioned ConfigMap stopped being rendered
+# A versioned ConfigMap outlives its last render by this long, so a workflow run that started on the old settings,
+# or a pod a scheduler starts from an old DAG version, still finds them.
+SUPERSEDED_GRACE = timedelta(days=7)
 
 # What berth renders into an app namespace, as kubectl resource types. Prune considers only these.
 MANAGED_TYPES = (
@@ -45,11 +55,14 @@ MANAGED_TYPES = (
 # Also looked at for hand-made objects: things people create in an emergency.
 # Not Secrets: External Secrets owns the ones apps use, and the report has no reason to read the rest.
 EXTRA_TYPES = ("pods", "jobs.batch", "statefulsets.apps", "daemonsets.apps", "ingresses.networking.k8s.io", "roles.rbac.authorization.k8s.io")
-# Created by Kubernetes itself in every namespace.
-_BUILT_IN = frozenset({("ServiceAccount", "default"), ("ConfigMap", "kube-root-ca.crt")})
+# Created by Kubernetes itself in every namespace, or by berth's own commands.
+_BUILT_IN = frozenset({("ServiceAccount", "default"), ("ConfigMap", "kube-root-ca.crt"), ("ConfigMap", BREAK_GLASS)})
 _NEVER_PRUNED = frozenset({"Namespace", "PersistentVolumeClaim"})
 _KEEP_KEY, _KEEP_VALUE = next(iter(KEEP.items()))
 _MANAGED_KEY, _MANAGED_VALUE = next(iter(MANAGED.items()))
+_VERSIONED_KEY, _VERSIONED_VALUE = next(iter(VERSIONED.items()))
+# Fields the API server sets on every object, which never mean the object differs from git.
+_SERVER_METADATA = ("managedFields", "resourceVersion", "generation", "uid", "creationTimestamp", "selfLink")
 
 
 @dataclass(frozen=True)
@@ -60,16 +73,12 @@ class BreakGlass:
     reason: str
     until: datetime
 
-    def encode(self) -> str:
-        return json.dumps({"by": self.by, "reason": self.reason, "until": self.until.isoformat()}, sort_keys=True)
+    def data(self) -> dict[str, str]:
+        return {"by": self.by, "reason": self.reason, "until": self.until.isoformat()}
 
     @staticmethod
-    def decode(text: str) -> "BreakGlass | None":
+    def from_data(data: Mapping[str, object]) -> "BreakGlass | None":
         try:
-            decoded: object = json.loads(text)
-            if not isinstance(decoded, dict):
-                return None
-            data = {str(key): value for key, value in decoded.items()}
             until = datetime.fromisoformat(str(data["until"]))
         except (ValueError, KeyError, TypeError):
             return None
@@ -81,14 +90,21 @@ class BreakGlass:
         return now < self.until
 
 
-def break_glass_of(namespace: ObjectRef | None) -> BreakGlass | None:
-    if namespace is None or BREAK_GLASS not in namespace.annotations:
+def break_glass_of(mark: ObjectRef | None) -> BreakGlass | None:
+    """The mark a `berth-break-glass` ConfigMap carries, or None if there is none or it is unreadable."""
+    if mark is None:
         return None
-    return BreakGlass.decode(namespace.annotations[BREAK_GLASS])
+    data = mark.body.get("data")
+    return BreakGlass.from_data({str(key): value for key, value in data.items()}) if isinstance(data, Mapping) else None
+
+
+def _versioned(ref: ObjectRef) -> bool:
+    return ref.kind == "ConfigMap" and ref.labels.get(_VERSIONED_KEY) == _VERSIONED_VALUE
 
 
 def prune_plan(rendered: Iterable[Mapping[str, object]], live: Iterable[ObjectRef]) -> list[ObjectRef]:
-    """Live objects berth made earlier that the specs no longer render. Never namespaces, volumes, or anything kept."""
+    """Live objects berth made earlier that the specs no longer render. Never namespaces, volumes, anything kept, or
+    versioned ConfigMaps, which `superseded` retires on its own schedule."""
     wanted = {(str(doc.get("kind")), object_name(doc)) for doc in rendered}
     return sorted(
         (
@@ -96,12 +112,69 @@ def prune_plan(rendered: Iterable[Mapping[str, object]], live: Iterable[ObjectRe
             for ref in live
             if ref.labels.get(_MANAGED_KEY) == _MANAGED_VALUE
             and not ref.owned
+            and not _versioned(ref)
             and ref.kind not in _NEVER_PRUNED
             and ref.annotations.get(_KEEP_KEY) != _KEEP_VALUE
             and (ref.kind, ref.name) not in wanted
         ),
         key=lambda ref: (ref.kind, ref.name),
     )
+
+
+@dataclass(frozen=True)
+class Retirement:
+    """What to do with an app namespace's versioned ConfigMaps once the namespace runs what git renders."""
+
+    mark: tuple[ObjectRef, ...] = ()  # no longer rendered: note when, so the grace period can start
+    unmark: tuple[ObjectRef, ...] = ()  # rendered again (a revert brings old settings back): forget the note
+    delete: tuple[ObjectRef, ...] = ()  # unrendered for longer than the grace period
+
+
+def superseded(live: Iterable[ObjectRef], wanted: Iterable[str], now: datetime, grace: timedelta = SUPERSEDED_GRACE) -> Retirement:
+    """Settings live in ConfigMaps named by a hash of their content, so every change leaves the old one behind.
+
+    `wanted` are the names git renders and the names live workloads use; those are never retired.
+    """
+    wanted = set(wanted)
+    mark: list[ObjectRef] = []
+    unmark: list[ObjectRef] = []
+    delete: list[ObjectRef] = []
+    for ref in sorted((ref for ref in live if _versioned(ref)), key=lambda ref: ref.name):
+        stamp = ref.annotations.get(SUPERSEDED_AT)
+        if ref.name in wanted:
+            if stamp is not None:
+                unmark.append(ref)
+            continue
+        try:
+            since = datetime.fromisoformat(stamp) if stamp is not None else None
+        except ValueError:
+            since = None
+        if since is None or since.tzinfo is None:
+            mark.append(ref)
+        elif now - since >= grace:
+            delete.append(ref)
+    return Retirement(tuple(mark), tuple(unmark), tuple(delete))
+
+
+def configmaps_used(objects: Iterable[ObjectRef]) -> set[str]:
+    """ConfigMaps the live workloads name, whatever git says, so one still in use is never retired."""
+    found: set[str] = set()
+
+    def walk(value: object) -> None:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                name = child.get("name") if isinstance(child, Mapping) else None
+                if key in {"configMapRef", "configMap", "configMapKeyRef"} and isinstance(name, str):
+                    found.add(name)
+                walk(child)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    for item in objects:
+        if item.kind in {"Deployment", "CronJob"}:
+            walk(item.body.get("spec"))
+    return found
 
 
 def unmanaged(live: Iterable[ObjectRef]) -> list[ObjectRef]:
@@ -114,27 +187,36 @@ def unmanaged(live: Iterable[ObjectRef]) -> list[ObjectRef]:
     return sorted(filter(made_by_hand, live), key=lambda ref: (ref.kind, ref.name))
 
 
+def missing(rendered: Iterable[Mapping[str, object]], live: Iterable[ObjectRef]) -> list[str]:
+    """`Kind/name` for each object git renders into the namespace that the cluster does not have."""
+    present = {(ref.kind, ref.name) for ref in live}
+    return [f"{doc.get('kind')}/{object_name(doc)}" for doc in rendered if doc.get("kind") != "Namespace" and (str(doc.get("kind")), object_name(doc)) not in present]
+
+
 def object_name(doc: Mapping[str, object]) -> str:
     meta = doc.get("metadata")
     return str(meta.get("name")) if isinstance(meta, dict) else ""
 
 
-_DIFF_HEADER = re.compile(r"^diff -u -N \S+/(?P<object>\S+) \S+$", re.MULTILINE)
+def comparable(obj: Mapping[str, object] | None) -> dict[str, object]:
+    """An object without what the API server keeps for itself (status, versions, the managed-fields record)."""
+    if obj is None:
+        return {}
+    meta = obj.get("metadata")
+    kept = {str(key): value for key, value in obj.items() if key != "status"}
+    if isinstance(meta, Mapping):
+        kept["metadata"] = {str(key): value for key, value in meta.items() if key not in _SERVER_METADATA}
+    return kept
 
 
-def changed_objects(diff: str, namespace: str) -> list[str]:
-    """`Kind/name` for each object in `kubectl diff` output. Its file names are `<group>.<version>.<Kind>.<ns>.<name>`."""
-    found: list[str] = []
-    for match in _DIFF_HEADER.finditer(diff):
-        parts = match["object"].split(".")
-        kind_at = next((index for index, part in enumerate(parts) if part[:1].isupper()), None)
-        if kind_at is None:
-            continue
-        rest = parts[kind_at + 1 :]
-        if rest[:1] == [namespace] and len(rest) > 1:
-            rest = rest[1:]
-        found.append(f"{parts[kind_at]}/{'.'.join(rest)}")
-    return found
+def object_diff(label: str, live: Mapping[str, object] | None, wanted: Mapping[str, object] | None) -> str:
+    """A unified diff from the live object to what applying git's version would make it; empty when they agree."""
+    before, after = comparable(live), comparable(wanted)
+    if before == after:
+        return ""
+    old = yamlio.dump(before).splitlines(keepends=True) if before else []
+    new = yamlio.dump(after).splitlines(keepends=True) if after else []
+    return "".join(difflib.unified_diff(old, new, f"live/{label}", f"git/{label}"))
 
 
 @dataclass(frozen=True)
@@ -142,7 +224,9 @@ class NamespaceDrift:
     namespace: str
     app: str | None
     env: str | None
+    not_deployed: str | None = None  # why the namespace does not yet run what git renders
     changed: tuple[str, ...] = ()
+    missing: tuple[str, ...] = ()
     by_hand: tuple[str, ...] = ()  # "Kind/name: manager: path" for fields a person set
     diff: str = ""
     unmanaged: tuple[str, ...] = ()
@@ -153,7 +237,13 @@ class NamespaceDrift:
 
     @property
     def in_sync(self) -> bool:
-        return not (self.changed or self.by_hand or self.unmanaged or self.not_in_git or self.error is not None)
+        differs = self.not_deployed is not None or self.changed or self.missing or self.by_hand or self.unmanaged
+        return not (differs or self.not_in_git or self.error is not None)
+
+    @property
+    def suspect(self) -> bool:
+        """Worth a full server-side diff. Otherwise the managed-fields record already shows nobody changed anything."""
+        return self.not_deployed is not None or bool(self.missing or self.by_hand or self.changed)
 
 
 @dataclass(frozen=True)
@@ -218,10 +308,6 @@ def _berths(ref: ObjectRef) -> set[str]:
     return {path for entry in ref.managed_fields if entry.manager == FIELD_MANAGER for path in _owned(entry.fields)}
 
 
-def _covered(path: str, ours: set[str]) -> bool:
-    return path in ours
-
-
 def _people(ref: ObjectRef) -> list[tuple[str, Mapping[str, object]]]:
     return [(entry.manager, entry.fields) for entry in ref.managed_fields if entry.subresource != "status" and entry.manager not in EXPECTED_MANAGERS]
 
@@ -229,16 +315,11 @@ def _people(ref: ObjectRef) -> list[tuple[str, Mapping[str, object]]]:
 def hand_changes(ref: ObjectRef) -> list[str]:
     """`manager: path` for every field a person set that git does not also set."""
     ours = _berths(ref)
-    return [
-        f"{manager}: {path}"
-        for manager, fields in _people(ref)
-        for path in field_paths(fields)
-        if path not in _HARMLESS and not path.startswith(".metadata.managedFields") and not _covered(path, ours)
-    ]
+    return [f"{manager}: {path}" for manager, fields in _people(ref) for path in field_paths(fields) if path not in _HARMLESS and not path.startswith(".metadata.managedFields") and path not in ours]
 
 
 def removal_patch(ref: ObjectRef) -> dict[str, object] | None:
-    """A strategic merge patch deleting every field a person added and git does not set, or None if none can be built."""
+    """A strategic merge patch deleting every field a person added that git does not set; None if none can be built."""
     if ref.kind not in _PATCHABLE:
         return None
     ours = _berths(ref)
@@ -262,7 +343,7 @@ def _without(fields: Mapping[str, object], ours: set[str], prefix: str = "") -> 
             inner = _without(tree, ours, path)
             if inner:
                 kept[key] = inner
-        elif not _covered(path, ours):
+        elif path not in ours:
             kept[key] = child
     return kept
 
@@ -314,8 +395,12 @@ def _describe(item: NamespaceDrift, now: datetime) -> str:
         parts.append(f"could not check: {item.error}")
     if item.not_in_git:
         parts.append("on the cluster but no longer in git")
+    if item.not_deployed is not None:
+        parts.append(item.not_deployed)
     if item.changed:
         parts.append("differs from git: " + ", ".join(item.changed))
+    if item.missing:
+        parts.append("missing: " + ", ".join(item.missing))
     if item.by_hand:
         parts.append("changed by hand: " + ", ".join(item.by_hand))
     if item.unmanaged:
@@ -323,14 +408,15 @@ def _describe(item: NamespaceDrift, now: datetime) -> str:
     if item.break_glass is not None:
         state = "until" if item.break_glass.active(now) else "EXPIRED"
         parts.append(f"break-glass by {item.break_glass.by} {state} {item.break_glass.until:%Y-%m-%d %H:%M %Z} ({item.break_glass.reason})")
-    elif item.changed or item.by_hand or item.unmanaged:
+    elif item.changed or item.by_hand or item.unmanaged or item.missing:
         parts.append("not marked")
     return "; ".join(parts)
 
 
 def text(report: Report) -> str:
     attention = report.attention
-    lines = [f"berth drift on {report.cluster}, {report.checked_at:%Y-%m-%d %H:%M %Z}: {len(report.namespaces) - len(attention)} in sync, {len(attention)} need attention"]
+    counts = f"{len(report.namespaces) - len(attention)} in sync, {len(attention)} need attention"
+    lines = [f"berth drift on {report.cluster}, {report.checked_at:%Y-%m-%d %H:%M %Z}: {counts}"]
     lines += [f"  {item.namespace}: {_describe(item, report.checked_at)}" for item in attention]
     lines += [f"  {name}: {url}" for name, url in report.links.items()]
     return "\n".join(lines) + "\n"

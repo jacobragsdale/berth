@@ -436,10 +436,24 @@ class Platform(Spec):
             if env.cluster not in self.clusters:
                 msg = f"environment {name!r} is on unknown cluster {env.cluster!r}"
                 raise ValueError(msg)
+        self.promotion_order()  # raises on a cycle
         return self
 
     def envs_on(self, cluster: str) -> list[str]:
-        return [name for name, env in self.environments.items() if env.cluster == cluster]
+        return [name for name in self.promotion_order() if self.environments[name].cluster == cluster]
+
+    def promotion_order(self) -> list[str]:
+        """Environments so that each comes after the one it promotes from (dev, qa, prod), then by name."""
+        order: list[str] = []
+        remaining = sorted(self.environments)
+        while remaining:
+            ready = [name for name in remaining if self.environments[name].promotes_from in (None, *order)]
+            if not ready:
+                msg = f"environments promote from each other in a cycle: {', '.join(remaining)}"
+                raise ValueError(msg)
+            order += ready
+            remaining = [name for name in remaining if name not in ready]
+        return order
 
 
 class SoftwareSecret(Spec):

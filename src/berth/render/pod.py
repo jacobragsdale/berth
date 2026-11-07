@@ -8,9 +8,10 @@ from dataclasses import dataclass, field
 from berth.fleet import Instance
 from berth.model import App, Platform, Service, Size, Task, duration_seconds
 
-GROUP = "berth.contoso.io"
+GROUP = "berth.contoso.io"  # the prefix of every label and annotation berth owns
 LABEL_APP = f"{GROUP}/app"
 LABEL_ENV = f"{GROUP}/env"
+MANAGED = {"app.kubernetes.io/managed-by": "berth"}  # on every object berth renders; what admission and prune select
 TASK_CONTAINER = "base"  # KubernetesPodOperator finds its container by this name
 SERVICE_CONTAINER = "main"
 RUN_AS = 10001

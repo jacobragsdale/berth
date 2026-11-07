@@ -3,9 +3,9 @@
 #
 # Azure DevOps schedules in UTC: 13:00 UTC is 9:00 in New York in summer and 8:00 in winter.
 #
-# Each cluster gets its own message, from its own step, with that cluster's deploy identity. `kubectl diff` is a
-# server-side dry run, and Kubernetes RBAC cannot grant "dry run only", so a read-only identity cannot check drift.
-# berth drift itself never writes.
+# Each cluster gets its own message, from its own step, with that cluster's deploy identity. berth reads who set each
+# field and diffs only the namespaces that look different, with a server-side dry run. Kubernetes RBAC cannot grant
+# "dry run only", so a read-only identity cannot check drift; berth drift itself never writes.
 #
 # Not yet run in Azure DevOps. Uses the deploy pipeline's service connections (berth-aks-qa, berth-aks-prod) and a
 # variable group berth-drift holding SLACK_WEBHOOK_URL, linked to Key Vault.

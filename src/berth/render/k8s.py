@@ -5,13 +5,14 @@ from collections.abc import Set as AbstractSet
 from types import MappingProxyType
 
 from berth.model import Override, Platform, Service, Software
-from berth.render.pod import LABEL_APP, LABEL_ENV, SERVICE_CONTAINER, Context, Doc, container, datadog_labels, pod_labels, pod_spec, task_job, telemetry_service, writable_volumes
+from berth.render.pod import GROUP, LABEL_APP, LABEL_ENV, MANAGED, SERVICE_CONTAINER, Context, Doc, container, datadog_labels, pod_labels, pod_spec, task_job, telemetry_service, writable_volumes
 
 _NONE: Mapping[str, str] = MappingProxyType[str, str]({})
-GROUP = "berth.contoso.io"
 # berth's prune never deletes an object carrying this, so data is never lost because a file went missing.
 KEEP = {f"{GROUP}/keep": "true"}
-MANAGED = {"app.kubernetes.io/managed-by": "berth"}
+# On ConfigMaps named by a hash of their content. Each change renders a new one; deploys retire the old ones after a
+# grace period (berth.drift.superseded) instead of leaving them for someone to prune.
+VERSIONED = {f"{GROUP}/versioned": "true"}
 PLATFORM_LABEL = f"{GROUP}/platform"
 POD_LAUNCHER = "berth-pod-launcher"
 JOB_LAUNCHER = "berth-job-launcher"
@@ -25,8 +26,8 @@ class RenderError(ValueError):
     pass
 
 
-def _meta(ctx: Context, name: str, *, component: str | None = None, annotations: Mapping[str, str] = _NONE) -> Doc:
-    meta: Doc = {"name": name, "namespace": ctx.instance.namespace, "labels": ctx.labels(component)}
+def _meta(ctx: Context, name: str, *, component: str | None = None, annotations: Mapping[str, str] = _NONE, labels: Mapping[str, str] = _NONE) -> Doc:
+    meta: Doc = {"name": name, "namespace": ctx.instance.namespace, "labels": ctx.labels(component) | dict(labels)}
     if annotations:
         meta["annotations"] = dict(annotations)
     return meta
@@ -79,9 +80,9 @@ def instance_objects(ctx: Context, callers: AbstractSet[str]) -> list[Doc]:
         subjects: list[Doc] = [{"apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": group} for group in environment.break_glass_groups]
         docs.append(_binding(ctx, BREAK_GLASS_ROLE, BREAK_GLASS_ROLE, subjects))
     if ctx.config_map is not None:
-        docs.append({"apiVersion": "v1", "kind": "ConfigMap", "metadata": _meta(ctx, ctx.config_map), "data": dict(instance.config)})
+        docs.append({"apiVersion": "v1", "kind": "ConfigMap", "metadata": _meta(ctx, ctx.config_map, labels=VERSIONED), "data": dict(instance.config)})
     if ctx.files_map is not None:
-        docs.append({"apiVersion": "v1", "kind": "ConfigMap", "metadata": _meta(ctx, ctx.files_map), "data": dict(instance.files)})
+        docs.append({"apiVersion": "v1", "kind": "ConfigMap", "metadata": _meta(ctx, ctx.files_map, labels=VERSIONED), "data": dict(instance.files)})
     if instance.secrets:
         docs.append(_external_secret(ctx))
     for name in sorted(instance.services):

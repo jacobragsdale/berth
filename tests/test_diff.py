@@ -64,13 +64,7 @@ def test_version_changes_are_ordinary_changes() -> None:
 
 def test_affected_apps_maps_rendered_paths_back_to_apps() -> None:
     base = head = fleet({"demo": (app_spec(), ENVS), "ledger": (app_spec(name="ledger"), {"prod": env_spec()})})
-    paths = [
-        "rendered/k8s/aks-qa/demo-dev/manifests.yaml",
-        "rendered/k8s/aks-prod/ledger-prod/manifests.yaml",
-        "rendered/k8s/aks-qa/_platform/platform.yaml",
-        "rendered/airflow/qa/demo__nightly.py",
-        "rendered/controlm/prod/ledger.json",
-    ]
+    paths = ["k8s/aks-qa/demo-dev/manifests.yaml", "k8s/aks-prod/ledger-prod/manifests.yaml", "k8s/aks-qa/_platform/platform.yaml", "airflow/qa/demo__nightly.py", "controlm/prod/ledger.json"]
     assert affected_apps(base, head, paths) == {"demo": {"dev", "qa"}, "ledger": {"prod"}}
 
 

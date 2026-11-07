@@ -1,23 +1,43 @@
-"""The only module that runs kubectl and Helm. It returns what they said as data; deciding what to do is elsewhere.
+"""The only module that talks to a cluster or runs Helm. It returns what they said as data; deciding what to do is
+elsewhere.
 
-Every apply is server-side with the field manager `berth`, so the API server records which fields berth owns.
-A field someone changed by hand (with `kubectl edit`, `scale`, `set`) belongs to another manager, so the next apply
-stops with a conflict instead of silently undoing it, and a server-side diff shows it as drift.
+berth calls the API server's REST API through `kubectl proxy`, listening on a Unix socket in a private directory.
+kubectl still handles the kubeconfig and the sign-in (kubelogin on AKS), and berth gets structured answers back: a
+conflict arrives as the fields and managers involved, not as text to search for.
+
+Every apply is server-side with the field manager `berth`, so the API server records which fields berth owns. A field
+someone changed by hand (`kubectl edit`, `scale`, `set`) belongs to another manager, so the next apply stops with a
+conflict instead of silently undoing it, and the managed-fields record shows it as drift.
 """
 
+import http.client
 import json
-import os
+import socket
 import subprocess
 import tempfile
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+import threading
+import time
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import override
+from urllib.parse import quote, urlencode
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 FIELD_MANAGER = "berth"
 STAMP_MANAGER = "berth-deploy"  # owns the deployed-commit annotations, so they never show as drift
-_TIMEOUT = 300
+_REQUEST_SECONDS = 60
+_PROXY_START_SECONDS = 30
+_NEW_KIND_SECONDS = 30  # how long a kind from a CRD applied moments ago may take to be served
+_PAGE = 500
+# Aggregated discovery (Kubernetes 1.30+): every group, version and resource in two requests.
+_DISCOVERY = "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList,application/json"
+_APPLY = "application/apply-patch+yaml"  # JSON is YAML, so berth sends JSON
+_HTTP_NOT_FOUND = 404
+_HTTP_CONFLICT = 409
+_HTTP_ERROR = 300
 
 
 class Tools(BaseSettings):
@@ -33,10 +53,30 @@ class KubeError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class Result:
-    code: int
-    stdout: str
-    stderr: str
+class Resource:
+    """One kind the API server serves, from discovery."""
+
+    group: str
+    version: str
+    plural: str
+    kind: str
+    namespaced: bool
+
+    @property
+    def api_version(self) -> str:
+        return f"{self.group}/{self.version}" if self.group else self.version
+
+    @property
+    def type_name(self) -> str:
+        """The name kubectl uses: `deployments.apps`, or just `pods` for the core group."""
+        return f"{self.plural}.{self.group}" if self.group else self.plural
+
+    def path(self, namespace: str | None = None, name: str | None = None) -> str:
+        base = f"/apis/{self.group}/{self.version}" if self.group else f"/api/{self.version}"
+        if self.namespaced and namespace is not None:
+            base += f"/namespaces/{quote(namespace)}"
+        base += f"/{self.plural}"
+        return base if name is None else f"{base}/{quote(name)}"
 
 
 @dataclass(frozen=True)
@@ -58,123 +98,343 @@ class ObjectRef:
     annotations: Mapping[str, str]
     owned: bool  # has ownerReferences: a controller made it, so it is not anyone's to manage
     managed_fields: tuple[ManagedFields, ...] = ()
+    api_version: str = ""
+    body: Mapping[str, object] = field(default_factory=dict, compare=False, repr=False)  # the whole object
 
     @property
     def key(self) -> tuple[str, str, str | None]:
         return (self.kind, self.name, self.namespace)
 
+    @staticmethod
+    def of(api_version: str, kind: str, name: str, namespace: str | None = None) -> "ObjectRef":
+        """A reference to an object by name, to act on it without having read it."""
+        return ObjectRef(kind, name, namespace, {}, {}, owned=False, api_version=api_version)
+
 
 @dataclass(frozen=True)
-class Kubectl:
-    binary: str
-    context: str
-    kubeconfig: str | None = None
+class Conflict:
+    """A field someone else owns that an apply would change, as the API server reported it."""
 
-    def run(self, *args: str, stdin: str | None = None) -> Result:
-        env = dict(os.environ) | {"KUBECTL_EXTERNAL_DIFF": "diff -u -N"}  # the format berth.drift reads
-        if self.kubeconfig is not None:
-            env["KUBECONFIG"] = self.kubeconfig
-        command = [self.binary, "--context", self.context, *args]
+    field: str  # .spec.replicas
+    message: str  # conflict with "kubectl" with subresource "scale" using apps/v1
+
+
+@dataclass(frozen=True)
+class Applied:
+    """The answer to one apply: the object as stored (or as it would be, for a dry run), or why not."""
+
+    kind: str
+    name: str
+    stored: Mapping[str, object] | None = None
+    conflicts: tuple[Conflict, ...] = ()
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.stored is not None
+
+
+class _UnixConnection(http.client.HTTPConnection):
+    def __init__(self, socket_path: str) -> None:
+        super().__init__("localhost", timeout=_REQUEST_SECONDS)
+        self._socket_path = socket_path
+
+    @override
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(_REQUEST_SECONDS)
+        sock.connect(self._socket_path)
+        self.sock = sock
+
+
+def _mapping(value: object) -> dict[str, object]:
+    return {str(key): item for key, item in value.items()} if isinstance(value, Mapping) else {}
+
+
+def _list(value: object) -> list[object]:
+    return list(value) if isinstance(value, list) else []
+
+
+def _status_message(payload: object, status: int) -> str:
+    message = _mapping(payload).get("message")
+    return str(message) if message else f"the API server answered {status}"
+
+
+class ApiServer:
+    """A cluster's API server, through `kubectl proxy`. Safe to use from several threads: each request is its own
+    connection to the proxy, and the proxy multiplexes them onto one connection to the cluster."""
+
+    def __init__(self, socket_path: str) -> None:
+        self._socket = socket_path
+        self._lock = threading.Lock()
+        self._by_kind: dict[tuple[str, str], Resource] = {}
+        self._by_type: dict[str, Resource] = {}
+
+    @staticmethod
+    @contextmanager
+    def connect(tools: Tools, context: str, kubeconfig: str | None = None) -> Generator["ApiServer"]:
+        """Start `kubectl proxy` for one kubeconfig context and yield a client for it. Only this user can reach the
+        socket: it lives in a fresh directory that only its owner may open."""
+        with tempfile.TemporaryDirectory(prefix="berth-") as private:
+            socket_path = str(Path(private) / "kube.sock")
+            command = [tools.kubectl, "--context", context, *(["--kubeconfig", kubeconfig] if kubeconfig is not None else []), "proxy", f"--unix-socket={socket_path}"]
+            try:
+                proxy = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            except FileNotFoundError as error:
+                msg = f"{tools.kubectl} not found; install kubectl or set BERTH_KUBECTL"
+                raise KubeError(msg) from error
+            with proxy:  # closes its pipe and reaps it on the way out
+                try:
+                    api = ApiServer(socket_path)
+                    api.wait_ready(proxy)
+                    yield api
+                finally:
+                    proxy.terminate()
+                    with suppress(subprocess.TimeoutExpired):
+                        proxy.wait(timeout=10)
+                    if proxy.poll() is None:
+                        proxy.kill()
+
+    def wait_ready(self, proxy: "subprocess.Popen[str]") -> None:
+        deadline = time.monotonic() + _PROXY_START_SECONDS
+        while True:
+            if proxy.poll() is not None:
+                error = proxy.stderr.read().strip() if proxy.stderr is not None else ""
+                msg = f"kubectl proxy stopped: {error or f'exit code {proxy.returncode}'}"
+                raise KubeError(msg)
+            if Path(self._socket).exists():
+                with suppress(OSError, KubeError):
+                    self.server_version()
+                    return
+            if time.monotonic() > deadline:
+                msg = "kubectl proxy did not start; check the kubeconfig context and that you are signed in"
+                raise KubeError(msg)
+            time.sleep(0.05)
+
+    def request(self, method: str, path: str, *, query: Mapping[str, str] | None = None, body: object = None, headers: Mapping[str, str] | None = None) -> tuple[int, object]:
+        """One call to the API server. `headers` adds to (or replaces) JSON in both directions."""
+        url = path if query is None else f"{path}?{urlencode(query)}"
+        connection = _UnixConnection(self._socket)
         try:
-            done = subprocess.run(command, input=stdin, capture_output=True, text=True, check=False, timeout=_TIMEOUT, env=env)
-        except FileNotFoundError as error:
-            msg = f"{self.binary} not found; install kubectl or set BERTH_KUBECTL"
+            payload = None if body is None else json.dumps(body)
+            connection.request(method, url, body=payload, headers={"Content-Type": "application/json", "Accept": "application/json"} | dict(headers or {}))
+            response = connection.getresponse()
+            data = response.read()
+        except OSError as error:
+            msg = f"{method} {path}: {error}"
             raise KubeError(msg) from error
-        return Result(done.returncode, done.stdout, done.stderr)
+        finally:
+            connection.close()
+        try:
+            parsed: object = json.loads(data) if data else None
+        except json.JSONDecodeError:
+            parsed = {"message": data.decode(errors="replace").strip()}
+        return response.status, parsed
 
-    def _ok(self, *args: str, stdin: str | None = None) -> str:
-        result = self.run(*args, stdin=stdin)
-        if result.code != 0:
-            msg = f"kubectl {' '.join(args[:3])}: {result.stderr.strip() or result.stdout.strip()}"
+    def _ok(self, method: str, path: str, *, query: Mapping[str, str] | None = None, body: object = None, headers: Mapping[str, str] | None = None) -> object:
+        status, payload = self.request(method, path, query=query, body=body, headers=headers)
+        if status >= _HTTP_ERROR:
+            msg = f"{method} {path}: {_status_message(payload, status)}"
             raise KubeError(msg)
-        return result.stdout
+        return payload
 
-    def apply(self, manifests: str, *, force_conflicts: bool = False) -> Result:
-        args = ["apply", "--server-side", f"--field-manager={FIELD_MANAGER}", "-f", "-"]
-        if force_conflicts:
-            args.append("--force-conflicts")
-        return self.run(*args, stdin=manifests)
+    # Discovery
 
-    def diff(self, manifests: str) -> Result:
-        """Exit code 0 means the cluster matches, 1 means it differs, anything else is an error."""
-        # --force-conflicts shows what reverting hand-made changes would do, rather than stopping at the conflict.
-        return self.run("diff", "--server-side", f"--field-manager={FIELD_MANAGER}", "--force-conflicts", "-f", "-", stdin=manifests)
+    def _discover(self) -> None:
+        by_kind: dict[tuple[str, str], Resource] = {}
+        by_type: dict[str, Resource] = {}
+        for root in ("/api", "/apis"):
+            payload = self._ok("GET", root, headers={"Accept": _DISCOVERY})
+            if _mapping(payload).get("kind") != "APIGroupDiscoveryList":
+                msg = "the API server does not offer aggregated discovery; berth needs Kubernetes 1.30 or later"
+                raise KubeError(msg)
+            for group in _list(_mapping(payload).get("items")):
+                name = str(_mapping(_mapping(group).get("metadata")).get("name", ""))
+                for version in _list(_mapping(group).get("versions")):  # the preferred version comes first
+                    for item in _list(_mapping(version).get("resources")):
+                        entry = _mapping(item)
+                        kind = _mapping(entry.get("responseKind")).get("kind")
+                        if not kind:
+                            continue
+                        resource = Resource(name, str(_mapping(version).get("version")), str(entry.get("resource")), str(kind), entry.get("scope") == "Namespaced")
+                        by_kind.setdefault((resource.api_version, resource.kind), resource)
+                        by_type.setdefault(resource.type_name, resource)
+        with self._lock:
+            self._by_kind, self._by_type = by_kind, by_type
 
-    def resource_types(self) -> set[str]:
-        """Plural resource names the server knows, qualified by group (`deployments.apps`, `pods`)."""
-        out = self._ok("api-resources", "--verbs=list", "-o", "name")
-        return {line.strip() for line in out.splitlines() if line.strip()}
+    def resource(self, api_version: str, kind: str) -> Resource:
+        """The resource for a kind, waiting briefly for one whose CRD was applied moments ago."""
+        deadline = time.monotonic() + _NEW_KIND_SECONDS
+        while True:
+            with self._lock:
+                found = self._by_kind.get((api_version, kind))
+            if found is not None:
+                return found
+            if time.monotonic() > deadline:
+                msg = f"the cluster does not serve {kind} ({api_version}); is its CRD installed?"
+                raise KubeError(msg)
+            self._discover()
+            with self._lock:
+                if (api_version, kind) in self._by_kind:
+                    continue
+            time.sleep(1)
 
-    def objects(self, types: Sequence[str], *, namespace: str | None = None, selector: str | None = None) -> list[ObjectRef]:
-        if not types:
-            return []
-        args = ["get", ",".join(types), "-o", "json", "--show-managed-fields"]
-        args += ["-n", namespace] if namespace is not None else []
-        args += ["-l", selector] if selector is not None else []
-        data: object = json.loads(self._ok(*args))
-        return [_ref(item) for item in _items(data)]
+    def resource_type(self, name: str) -> Resource | None:
+        """A resource by kubectl's name for it (`deployments.apps`), or None if the cluster does not serve it."""
+        with self._lock:
+            known = bool(self._by_type)
+        if not known:
+            self._discover()
+        with self._lock:
+            return self._by_type.get(name)
 
-    def patch(self, ref: ObjectRef, patch: Mapping[str, object]) -> None:
+    # Reads
+
+    def get(self, resource: Resource, name: str, namespace: str | None = None) -> dict[str, object] | None:
+        status, payload = self.request("GET", resource.path(namespace, name))
+        if status == _HTTP_NOT_FOUND:
+            return None
+        if status >= _HTTP_ERROR:
+            msg = f"GET {resource.kind}/{name}: {_status_message(payload, status)}"
+            raise KubeError(msg)
+        return _mapping(payload)
+
+    def list(self, resource: Resource, *, namespace: str | None = None, labels: str | None = None, fields: str | None = None) -> list[ObjectRef]:
+        """Every object of one kind, across all namespaces unless one is given, a page at a time."""
+        query = {"limit": str(_PAGE)} | ({"labelSelector": labels} if labels is not None else {}) | ({"fieldSelector": fields} if fields is not None else {})
+        found: list[ObjectRef] = []
+        while True:
+            page = _mapping(self._ok("GET", resource.path(namespace), query=query))
+            found += [ref(_mapping(item) | {"kind": resource.kind, "apiVersion": resource.api_version}) for item in _list(page.get("items"))]
+            more = _mapping(page.get("metadata")).get("continue")
+            if not more:
+                return found
+            query = query | {"continue": str(more)}
+
+    # Writes
+
+    def apply(self, doc: Mapping[str, object], *, manager: str = FIELD_MANAGER, force: bool = False, dry_run: bool = False, default_namespace: str | None = None) -> Applied:
+        """Server-side apply of one object. A conflict is an answer, not an error: it says who owns what."""
+        kind, api_version = str(doc.get("kind", "")), str(doc.get("apiVersion", ""))
+        meta = _mapping(doc.get("metadata"))
+        name = str(meta.get("name", ""))
+        try:
+            resource = self.resource(api_version, kind)
+        except KubeError as error:
+            return Applied(kind, name, error=str(error))
+        written = meta.get("namespace")
+        namespace = (str(written) if written is not None else default_namespace) if resource.namespaced else None
+        if resource.namespaced and namespace is None:
+            return Applied(kind, name, error=f"{kind}/{name} has no namespace")
+        if namespace is not None and written is None:
+            doc = dict(doc) | {"metadata": meta | {"namespace": namespace}}  # as kubectl apply -n would
+        query = {"fieldManager": manager} | ({"force": "true"} if force else {}) | ({"dryRun": "All"} if dry_run else {})
+        status, payload = self.request("PATCH", resource.path(namespace, name), query=query, body=doc, headers={"Content-Type": _APPLY})
+        if status < _HTTP_ERROR:
+            return Applied(kind, name, stored=_mapping(payload))
+        if status == _HTTP_CONFLICT:
+            causes = _list(_mapping(_mapping(payload).get("details")).get("causes"))
+            conflicts = tuple(Conflict(str(_mapping(cause).get("field", "")), str(_mapping(cause).get("message", ""))) for cause in causes)
+            if conflicts:
+                return Applied(kind, name, conflicts=conflicts)
+        return Applied(kind, name, error=_status_message(payload, status))
+
+    def patch(self, target: ObjectRef, patch: Mapping[str, object]) -> None:
         """A strategic merge patch, which can delete list items by their key, under berth's own field manager."""
-        args = ["patch", ref.kind, ref.name, "--type=strategic", "-p", json.dumps(patch), f"--field-manager={FIELD_MANAGER}"]
-        self._ok(*args, *(["-n", ref.namespace] if ref.namespace is not None else []))
+        resource = self.resource(target.api_version, target.kind)
+        path = resource.path(target.namespace, target.name)
+        self._ok("PATCH", path, query={"fieldManager": FIELD_MANAGER}, body=dict(patch), headers={"Content-Type": "application/strategic-merge-patch+json"})
 
-    def delete(self, ref: ObjectRef) -> None:
-        args = ["delete", ref.kind, ref.name, "--wait=false"]
-        self._ok(*args, *(["-n", ref.namespace] if ref.namespace is not None else []))
+    def delete(self, target: ObjectRef) -> None:
+        resource = self.resource(target.api_version, target.kind)
+        status, payload = self.request("DELETE", resource.path(target.namespace, target.name), query={"propagationPolicy": "Background"})
+        if status >= _HTTP_ERROR and status != _HTTP_NOT_FOUND:
+            msg = f"DELETE {target.kind}/{target.name}: {_status_message(payload, status)}"
+            raise KubeError(msg)
 
-    def annotate_namespace(self, namespace: str, annotations: Mapping[str, str | None], *, manager: str) -> None:
-        pairs = [f"{key}-" if value is None else f"{key}={value}" for key, value in annotations.items()]
-        self._ok("annotate", "namespace", namespace, *pairs, "--overwrite", f"--field-manager={manager}")
+    def annotate(self, target: ObjectRef, annotations: Mapping[str, str], *, manager: str) -> None:
+        """Own exactly these annotations as `manager`. Annotations the manager set before and leaves out are removed."""
+        meta: dict[str, object] = {"name": target.name, "annotations": dict(annotations)}
+        if target.namespace is not None:
+            meta["namespace"] = target.namespace
+        applied = self.apply({"apiVersion": target.api_version, "kind": target.kind, "metadata": meta}, manager=manager, force=True)
+        if not applied.ok:
+            msg = f"annotate {target.kind}/{target.name}: {applied.error}"
+            raise KubeError(msg)
 
-    def namespaces(self, selector: str) -> list[ObjectRef]:
-        return self.objects(["namespaces"], selector=selector)
-
-    def rollout_status(self, namespace: str, deployment: str, timeout_seconds: int) -> Result:
-        return self.run("rollout", "status", f"deployment/{deployment}", "-n", namespace, f"--timeout={timeout_seconds}s")
+    # Facts about the cluster
 
     def server_version(self) -> str:
-        data: object = json.loads(self._ok("version", "-o", "json"))
-        server = data.get("serverVersion") if isinstance(data, dict) else None
-        version = server.get("gitVersion") if isinstance(server, dict) else None
+        version = _mapping(self._ok("GET", "/version")).get("gitVersion")
         if not isinstance(version, str):
-            msg = "kubectl version did not report the server's version"
+            msg = "the API server did not report its version"
             raise KubeError(msg)
         return version.lstrip("v").split("-", 1)[0]
 
-    def whoami(self) -> str:
-        return self._ok("auth", "whoami", "-o", "jsonpath={.status.userInfo.username}").strip()
+    def whoami(self) -> tuple[str, frozenset[str]]:
+        """The signed-in user and their groups, as the cluster sees them (Entra group object IDs on AKS)."""
+        review = {"apiVersion": "authentication.k8s.io/v1", "kind": "SelfSubjectReview"}
+        info = _mapping(_mapping(_mapping(self._ok("POST", "/apis/authentication.k8s.io/v1/selfsubjectreviews", body=review)).get("status")).get("userInfo"))
+        return str(info.get("username", "?")), frozenset(str(group) for group in _list(info.get("groups")))
+
+    def rollout(self, namespace: str, name: str, timeout_seconds: float, *, poll_seconds: float = 2.0) -> str | None:
+        """Wait for a Deployment's rollout, as `kubectl rollout status` does. None when complete, otherwise why not."""
+        resource = self.resource("apps/v1", "Deployment")
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            deployment = self.get(resource, name, namespace)
+            if deployment is None:
+                return "the Deployment does not exist"
+            done, why = rollout_state(deployment)
+            if done:
+                return None
+            if why.startswith("failed") or time.monotonic() > deadline:
+                return why
+            time.sleep(poll_seconds)
 
 
-def _items(data: object) -> list[dict[str, object]]:
-    if not isinstance(data, dict):
-        return []
-    items = data.get("items", [data] if "kind" in data and data.get("kind") != "List" else [])
-    return [{str(key): value for key, value in item.items()} for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+def _count(values: Mapping[str, object], key: str, default: int = 0) -> int:
+    value = values.get(key, default)
+    return value if isinstance(value, int) else default
 
 
-def _strings(value: object) -> dict[str, str]:
-    return {str(key): str(item) for key, item in value.items()} if isinstance(value, dict) else {}
+def rollout_state(deployment: Mapping[str, object]) -> tuple[bool, str]:
+    """Whether a Deployment has finished rolling out, by the rules `kubectl rollout status` uses."""
+    meta, spec, status = (_mapping(deployment.get(part)) for part in ("metadata", "spec", "status"))
+    if _count(status, "observedGeneration") < _count(meta, "generation"):
+        return False, "waiting for the Deployment controller"
+    for condition in _list(status.get("conditions")):
+        entry = _mapping(condition)
+        if entry.get("type") == "Progressing" and entry.get("reason") == "ProgressDeadlineExceeded":
+            return False, f"failed: {entry.get('message', 'progress deadline exceeded')}"
+    wanted, updated = _count(spec, "replicas", 1), _count(status, "updatedReplicas")
+    current, available = _count(status, "replicas"), _count(status, "availableReplicas")
+    if updated < wanted:
+        return False, f"{updated} of {wanted} new pods created"
+    if current > updated:
+        return False, f"{current - updated} old pods still running"
+    if available < updated:
+        return False, f"{available} of {updated} new pods ready"
+    return True, ""
 
 
-def _ref(item: Mapping[str, object]) -> ObjectRef:
-    meta = item.get("metadata")
-    meta = meta if isinstance(meta, dict) else {}
+def ref(item: Mapping[str, object]) -> ObjectRef:
+    meta = _mapping(item.get("metadata"))
     namespace = meta.get("namespace")
-    entries = meta.get("managedFields")
     managed = tuple(
         ManagedFields(str(entry.get("manager", "")), str(entry.get("operation", "")), str(entry.get("subresource", "")), _tree(entry.get("fieldsV1")))
-        for entry in (entries if isinstance(entries, list) else [])
-        if isinstance(entry, dict)
+        for entry in (_mapping(raw) for raw in _list(meta.get("managedFields")))
     )
     return ObjectRef(
         kind=str(item.get("kind", "")),
         name=str(meta.get("name", "")),
         namespace=str(namespace) if namespace is not None else None,
-        labels=_strings(meta.get("labels")),
-        annotations=_strings(meta.get("annotations")),
+        labels={str(k): str(v) for k, v in _mapping(meta.get("labels")).items()},
+        annotations={str(k): str(v) for k, v in _mapping(meta.get("annotations")).items()},
         owned=bool(meta.get("ownerReferences")),
         managed_fields=managed,
+        api_version=str(item.get("apiVersion", "")),
+        body=dict(item),
     )
 
 
@@ -188,7 +448,7 @@ def helm_template(helm: str, args: Sequence[str], values: Mapping[str, object]) 
         values_file = Path(tmp) / "values.json"
         values_file.write_text(json.dumps(values))
         try:
-            done = subprocess.run([helm, *args, "--values", str(values_file)], capture_output=True, text=True, check=False, timeout=_TIMEOUT)
+            done = subprocess.run([helm, *args, "--values", str(values_file)], capture_output=True, text=True, check=False, timeout=300)
         except FileNotFoundError as error:
             msg = f"{helm} not found; install Helm or set BERTH_HELM"
             raise KubeError(msg) from error

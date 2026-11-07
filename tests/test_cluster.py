@@ -1,4 +1,4 @@
-"""`berth deploy`, `drift` and `breakglass` against a real kube-apiserver, and the admission policies it enforces.
+"""`berth deploy`, `drift` and `breakglass` against a real kube-apiserver, and the policies and roles it enforces.
 
 Integration tier: needs the envtest binaries (scripts/fetch-tools.sh) and network access once, to fetch the CRDs
 from the platform software charts. The API server stores and admits objects; nothing runs, so rollouts are not
@@ -12,21 +12,23 @@ import shutil
 import subprocess
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from apiserver import BIN, apiserver
+from apiserver import BIN, TOKEN, apiserver
 from support import REPO
 
 from berth import gitio
 from berth.cli import parse, run
 from berth.fleet import load
 from berth.kube import helm_template
+from berth.operate import Results, State
 from berth.render.software import releases, template_args, values
 
 pytestmark = pytest.mark.integration
 NOW = datetime(2026, 11, 9, 14, tzinfo=UTC)
+DEVELOPERS = "77777777-7777-7777-7777-777777777777"  # dev's break-glass group in platform.yaml
 
 
 @dataclass(frozen=True)
@@ -34,9 +36,10 @@ class Cluster:
     repo: Path
     kubeconfig: Path
 
-    def berth(self, *argv: str) -> tuple[int, str]:
+    def berth(self, *argv: str, now: datetime = NOW, kubeconfig: Path | None = None) -> tuple[int, str]:
         out = io.StringIO()
-        code = run(parse(["--root", str(self.repo), *argv, *(["--kubeconfig", str(self.kubeconfig)] if argv[0] in {"deploy", "drift", "breakglass"} else [])]), out, NOW)
+        connection = ["--kubeconfig", str(kubeconfig or self.kubeconfig)] if argv[0] in {"deploy", "drift", "breakglass"} else []
+        code = run(parse(["--root", str(self.repo), *argv, *connection]), out, now)
         return code, out.getvalue()
 
     def kubectl(self, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -46,6 +49,9 @@ class Cluster:
         code, out = self.berth("drift", "--cluster", "aks-qa")
         assert code == 0, out
         return out
+
+    def commit(self, message: str) -> None:
+        _git(self.repo, "commit", "-qam", message)
 
 
 def _git(root: Path, *args: str) -> None:
@@ -71,13 +77,13 @@ def cluster(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Cluster]:
     repo = work / "repo"
     for part in ("platform", "apps"):
         shutil.copytree(REPO / part, repo / part)
+    shutil.copy(REPO / ".gitignore", repo / ".gitignore")
     with pytest.MonkeyPatch.context() as env:
         env.setenv("BERTH_KUBECTL", str(BIN / "kubectl"))
         env.setenv("BERTH_HELM", str(BIN / "helm"))
         for name in ("CACHE", "CONFIG", "DATA"):
             env.setenv(f"HELM_{name}_HOME", str(REPO / ".tools" / "helm" / name.lower()))
         _git(repo, "init", "-q", "-b", "main")
-        assert run(parse(["--root", str(repo), "render"]), io.StringIO(), NOW) == 0
         _git(repo, "add", ".")
         _git(repo, "commit", "-q", "-m", "base")
         with apiserver(work / "api") as kubeconfig:
@@ -89,44 +95,88 @@ def cluster(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Cluster]:
             yield here
 
 
-def test_a_fresh_deploy_leaves_every_app_namespace_in_sync(cluster: Cluster) -> None:
+def test_a_fresh_deploy_leaves_every_app_namespace_in_sync_and_stamped(cluster: Cluster) -> None:
     assert "14 in sync, 0 need attention" in cluster.drift()
-    stamped = cluster.kubectl("get", "namespace", "ledger-dev", "-o", "jsonpath={.metadata.annotations.berth\\.contoso\\.io/deployed-commit}")
-    assert len(stamped.stdout) == 40
+    annotations = json.loads(cluster.kubectl("get", "namespace", "ledger-dev", "-o", "jsonpath={.metadata.annotations}").stdout)
+    assert len(annotations["berth.contoso.io/deployed-commit"]) == 40
+    assert len(annotations["berth.contoso.io/deployed-digest"]) == 64
 
 
-def test_a_variable_added_by_hand_is_reported_kept_by_deploys_and_removed_by_revert(cluster: Cluster) -> None:
+def test_a_deploy_with_nothing_changed_touches_no_app_namespace(cluster: Cluster) -> None:
+    code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")
+    assert code == 0, out
+    assert "14 unchanged" in out
+    assert "applied" not in out.replace("platform: applied", "")
+
+
+def test_a_variable_added_by_hand_is_reported_and_removed_by_revert(cluster: Cluster) -> None:
     assert cluster.kubectl("set", "env", "deployment/ledger-api", "-n", "ledger-dev", "LOG_LEVEL=debug").returncode == 0
     added = "Deployment/ledger-api: kubectl-set: .spec.template.spec.containers[name=main].env[name=LOG_LEVEL]"
     assert added in cluster.drift()
     code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "ledger", "--env", "dev")
-    assert code == 0, out
-    assert "kept a change made by hand" in out
+    assert (code, "1 unchanged" in out) == (0, True)  # git did not change, so the deploy leaves it alone
     code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "ledger", "--env", "dev", "--revert")
-    assert code == 0
+    assert code == 0, out
     assert "removed Deployment/ledger-api" in out
     assert "ledger-dev" not in cluster.drift()
 
 
 def test_a_scale_by_hand_blocks_deploys_until_marked_break_glass_or_reverted(cluster: Cluster) -> None:
     assert cluster.kubectl("scale", "deployment/payments-api-api", "-n", "payments-api-dev", "--replicas=4").returncode == 0
-    code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "payments-api", "--env", "dev")
-    assert code == 1
+    report = cluster.drift()
+    assert "payments-api-dev: differs from git: Deployment/payments-api-api" in report
+    code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "payments-api", "--env", "dev", "--all")
+    assert code == 2  # an app failed; the platform did not
     assert ".spec.replicas" in out
     assert "adopt the change in the spec, or deploy with --revert" in out
 
     code, out = cluster.berth("breakglass", "payments-api", "--env", "dev", "--reason", "load test needs four replicas")
     assert code == 0, out
-    code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "payments-api", "--env", "dev")
+    code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "payments-api", "--env", "dev", "--all")
     assert code == 0, out
-    assert "skipped, break-glass by berth-test-admin" in out
-    assert "break-glass by berth-test-admin until" in cluster.drift()
+    assert "skipped: break-glass by berth-test-admin" in out
+    report = cluster.drift()
+    assert "break-glass by berth-test-admin until" in report
+    assert "ConfigMap/berth-break-glass" not in report  # the mark itself is not drift
 
     assert cluster.berth("breakglass", "payments-api", "--env", "dev", "--end")[0] == 0
     code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "payments-api", "--env", "dev", "--revert")
     assert code == 0, out
     assert cluster.kubectl("get", "deployment", "payments-api-api", "-n", "payments-api-dev", "-o", "jsonpath={.spec.replicas}").stdout == "1"
     assert "payments-api-dev" not in cluster.drift()
+
+
+def test_a_failure_holds_that_app_in_the_next_environment_and_no_other_app(cluster: Cluster, tmp_path: Path) -> None:
+    app = cluster.repo / "apps/payments-api/app.yaml"
+    original = app.read_text()
+    assert cluster.kubectl("scale", "deployment/payments-api-api", "-n", "payments-api-dev", "--replicas=3").returncode == 0
+    try:
+        app.write_text(original.replace("SETTLEMENT_CURRENCY: USD", "SETTLEMENT_CURRENCY: EUR"))  # reaches dev, qa and prod
+        (cluster.repo / "apps/ledger/qa.yaml").write_text((cluster.repo / "apps/ledger/qa.yaml").read_text() + "config:\n  LOG_LEVEL: warn\n")
+        cluster.commit("payments-api settles in euros; ledger qa logs warnings")
+        results_file = tmp_path / "results.json"
+        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software", "--results-out", str(results_file))
+        assert code == 2, out
+        results = Results.model_validate_json(results_file.read_text())
+        assert results.namespaces["payments-api-dev"].state is State.FAILED
+        assert results.namespaces["payments-api-qa"].state is State.HELD
+        assert results.namespaces["ledger-qa"].state is State.DEPLOYED  # another app is not held
+        assert "payments-api-qa: not deployed" in cluster.drift()
+
+        # The prod cluster's deploy reads qa's results and holds payments-api there too.
+        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software", "--hold-from", str(results_file), "--app", "payments-api", "--env", "qa")
+        assert (code, "held" in out) == (2, True)
+
+        assert cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "payments-api", "--env", "dev", "--revert")[0] == 0
+        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")
+        assert code == 0, out
+        assert "payments-api-qa: applied" in out
+        assert "1 deployed" in out  # only qa was left to do
+    finally:
+        app.write_text(original)
+        _git(cluster.repo, "checkout", "-q", "HEAD~1", "--", "apps/ledger/qa.yaml")
+        cluster.commit("restore")
+        assert cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")[0] == 0
 
 
 def test_a_change_adopted_into_the_spec_deploys_cleanly_and_stops_being_drift(cluster: Cluster) -> None:
@@ -136,15 +186,13 @@ def test_a_change_adopted_into_the_spec_deploys_cleanly_and_stops_being_drift(cl
     assert "Deployment/ledger-api: kubectl: .spec.replicas" in cluster.drift()
     try:
         env_file.write_text(original + "services:\n  api: {replicas: 2}\n")
-        assert run(parse(["--root", str(cluster.repo), "render"]), io.StringIO(), NOW) == 0
-        _git(cluster.repo, "commit", "-qam", "keep two ledger replicas in qa")
+        cluster.commit("keep two ledger replicas in qa")
         code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "ledger", "--env", "qa")
         assert code == 0, out  # git now sets the same value, so there is no conflict
         assert "ledger-qa" not in cluster.drift()
     finally:
         env_file.write_text(original)
-        assert run(parse(["--root", str(cluster.repo), "render"]), io.StringIO(), NOW) == 0
-        _git(cluster.repo, "commit", "-qam", "restore")
+        cluster.commit("restore")
         cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "ledger", "--env", "qa", "--revert")
 
 
@@ -154,31 +202,100 @@ def test_an_object_made_by_hand_is_reported(cluster: Cluster) -> None:
     assert cluster.kubectl("delete", "configmap", "tmp-fix", "-n", "ledger-qa").returncode == 0
 
 
+def test_an_object_deleted_by_hand_is_reported_missing(cluster: Cluster) -> None:
+    assert cluster.kubectl("delete", "networkpolicy", "berth-ingress", "-n", "ledger-qa").returncode == 0
+    report = cluster.drift()
+    assert "ledger-qa: differs from git: NetworkPolicy/berth-ingress; missing: NetworkPolicy/berth-ingress" in report
+    assert cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "ledger", "--env", "qa", "--all")[0] == 0
+    assert "ledger-qa" not in cluster.drift()
+
+
 def test_prune_deletes_what_git_dropped_but_never_volumes(cluster: Cluster) -> None:
-    app = cluster.repo / "apps/doc-indexer/app.yaml"
-    original = app.read_text()
-    before = cluster.kubectl("get", "configmaps", "-n", "doc-indexer-dev", "-l", "app.kubernetes.io/managed-by=berth", "-o", "name").stdout.split()
+    batch, indexer = cluster.repo / "apps/risk-batch/app.yaml", cluster.repo / "apps/doc-indexer/app.yaml"
+    originals = batch.read_text(), indexer.read_text()
     try:
-        # New file contents rename the files ConfigMap, leaving the old one behind; dropping the volume unrenders the claim.
-        changed = original.replace("sharepoint = true", "sharepoint = false").replace("    volumes:\n      index: {path: /var/lib/indexer, size_gi: 20}\n", "")
-        assert changed != original
-        app.write_text(changed)
-        assert run(parse(["--root", str(cluster.repo), "render"]), io.StringIO(), NOW) == 0
-        _git(cluster.repo, "commit", "-qam", "new files, no volume")
-        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "doc-indexer", "--env", "dev")
+        cleanup = originals[0][originals[0].index("  cleanup:\n") : originals[0].index("secrets:")]
+        batch.write_text(originals[0].replace(cleanup, ""))
+        indexer.write_text(originals[1].replace("    volumes:\n      index: {path: /var/lib/indexer, size_gi: 20}\n", ""))
+        cluster.commit("no cleanup job; no index volume")
+        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")
         assert code == 0, out
-        assert "is no longer in git; deploy with --prune to delete it" in out
-        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "doc-indexer", "--env", "dev", "--prune")
+        assert "risk-batch-dev: CronJob/risk-batch-cleanup is no longer in git; deploy with --prune to delete it" in out
+        assert "CronJob/risk-batch-cleanup (removed from git)" in cluster.drift()
+        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software", "--all", "--prune")
         assert code == 0, out
-        after = cluster.kubectl("get", "configmaps", "-n", "doc-indexer-dev", "-l", "app.kubernetes.io/managed-by=berth", "-o", "name").stdout.split()
-        assert len(after) == len(before)
-        assert set(after) != set(before)
+        assert "risk-batch-dev: deleted CronJob/risk-batch-cleanup" in out
         assert cluster.kubectl("get", "pvc", "doc-indexer-worker-index", "-n", "doc-indexer-dev").returncode == 0  # data is never pruned
     finally:
-        app.write_text(original)
-        assert run(parse(["--root", str(cluster.repo), "render"]), io.StringIO(), NOW) == 0
-        _git(cluster.repo, "commit", "-qam", "restore")
-        cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "doc-indexer", "--env", "dev", "--prune")
+        batch.write_text(originals[0])
+        indexer.write_text(originals[1])
+        cluster.commit("restore")
+        assert cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")[0] == 0
+
+
+def _config_maps(cluster: Cluster, namespace: str) -> dict[str, dict[str, str]]:
+    found = json.loads(cluster.kubectl("get", "configmaps", "-n", namespace, "-l", "berth.contoso.io/versioned=true", "-o", "json").stdout)
+    return {item["metadata"]["name"]: item["metadata"].get("annotations", {}) for item in found["items"]}
+
+
+def test_settings_that_were_replaced_are_retired_after_a_grace_period(cluster: Cluster) -> None:
+    indexer = cluster.repo / "apps/doc-indexer/app.yaml"
+    original = indexer.read_text()
+    before = set(_config_maps(cluster, "doc-indexer-dev"))
+    try:
+        indexer.write_text(original.replace("sharepoint = true", "sharepoint = false"))
+        cluster.commit("index without SharePoint")
+        assert cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")[0] == 0
+        assert len(_config_maps(cluster, "doc-indexer-dev")) == len(before) + 1  # the new one, beside the old
+        assert "doc-indexer-dev" not in cluster.drift()  # an old settings ConfigMap is not drift
+
+        # The next deploy sees the Deployment no longer uses the old one and notes when it was superseded...
+        assert cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")[0] == 0
+        (old,) = before
+        assert "berth.contoso.io/superseded-at" in _config_maps(cluster, "doc-indexer-dev")[old]
+        # ...and a deploy more than a week later deletes it.
+        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software", now=NOW + timedelta(days=8))
+        assert code == 0, out
+        assert f"doc-indexer-dev: deleted ConfigMap/{old}" in out
+        assert old not in _config_maps(cluster, "doc-indexer-dev")
+    finally:
+        indexer.write_text(original)
+        cluster.commit("restore")
+        assert cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")[0] == 0
+
+
+def _as_developer(cluster: Cluster, tmp_path: Path) -> Path:
+    """A kubeconfig that acts as a developer in dev's break-glass group, by impersonation."""
+    text = cluster.kubeconfig.read_text().replace(f"user: {{token: {TOKEN}}}", f"user: {{token: {TOKEN}, as: dana@contoso.com, as-groups: [{DEVELOPERS}, system:authenticated]}}")
+    path = tmp_path / "developer.kubeconfig"
+    path.write_text(text)
+    return path
+
+
+def test_break_glass_can_change_workloads_but_not_read_secrets_or_open_a_shell(cluster: Cluster, tmp_path: Path) -> None:
+    developer = _as_developer(cluster, tmp_path)
+
+    def kubectl(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([str(BIN / "kubectl"), f"--kubeconfig={developer}", "--context", "aks-qa", *args], capture_output=True, text=True, check=False)
+
+    def can(verb: str, resource: str, namespace: str = "ledger-dev") -> str:
+        return kubectl("auth", "can-i", verb, resource, "-n", namespace).stdout.strip()
+
+    assert can("patch", "deployments") == "yes"
+    assert can("create", "jobs") == "yes"
+    assert can("get", "secrets") == "no"
+    assert can("create", "pods/exec") == "no"
+    assert can("create", "rolebindings") == "no"
+    assert can("patch", "namespaces/ledger-dev") == "no"
+    assert can("patch", "deployments", namespace="kube-system") == "no"
+    assert kubectl("scale", "deployment/ledger-api", "-n", "ledger-dev", "--replicas=2").returncode == 0
+
+    code, out = cluster.berth("breakglass", "ledger", "--env", "dev", "--reason", "scaling for an incident", kubeconfig=developer)
+    assert code == 0, out
+    assert "break-glass by dana@contoso.com" in out
+    assert "warning" not in out  # dana is in the group
+    assert cluster.berth("breakglass", "ledger", "--env", "dev", "--end", kubeconfig=developer)[0] == 0
+    assert cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "ledger", "--env", "dev", "--revert")[0] == 0
 
 
 def _pod(*, image: str = "contosoacr.azurecr.io/ledger:1@sha256:" + "a" * 64, memory_limit: bool = True) -> dict[str, object]:
@@ -241,9 +358,10 @@ def test_a_namespace_cannot_drop_to_one_owner(cluster: Cluster) -> None:
 
 def test_the_api_server_accepts_a_valid_pod_and_every_pod_the_schedulers_start(cluster: Cluster, tmp_path: Path) -> None:
     assert cluster.kubectl("create", "--dry-run=server", "-f", "-", stdin=json.dumps(_pod())).returncode == 0
-    subprocess.run(["uv", "run", "python", "-I", str(REPO / "scripts/extract_workloads.py"), str(cluster.repo / "rendered"), str(tmp_path)], check=True, capture_output=True)  # noqa: S607
+    assert cluster.berth("render", "--out", str(tmp_path / "rendered"))[0] == 0
+    subprocess.run(["uv", "run", "python", "-I", str(REPO / "scripts/extract_workloads.py"), str(tmp_path / "rendered"), str(tmp_path / "pods")], check=True, capture_output=True)  # noqa: S607
     # This API server stands in for the qa cluster, which runs dev and qa.
-    workloads = sorted(path for path in tmp_path.glob("*.yaml") if not path.name.startswith(("airflow-prod-", "controlm-prod-")))
+    workloads = sorted(path for path in (tmp_path / "pods").glob("*.yaml") if not path.name.startswith(("airflow-prod-", "controlm-prod-")))
     assert workloads
     for workload in workloads:
         done = cluster.kubectl("create", "--dry-run=server", "-f", str(workload))

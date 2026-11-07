@@ -3,7 +3,8 @@
 import os
 import re
 import subprocess
-from collections.abc import Iterable
+import tempfile
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from berth.fleet import Tree
@@ -18,10 +19,16 @@ class GitError(RuntimeError):
     pass
 
 
-def _git(root: Path, *args: str, stdin: bytes | None = None) -> bytes:
+def _env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items() if key not in _REPO_OVERRIDES}
+    if extra is not None:
+        env.update(extra)
+    return env
+
+
+def _git(root: Path, *args: str, stdin: bytes | None = None, env: Mapping[str, str] | None = None) -> bytes:
     try:
-        env = {key: value for key, value in os.environ.items() if key not in _REPO_OVERRIDES}
-        done = subprocess.run(["git", "-C", str(root), *args], input=stdin, capture_output=True, check=True, timeout=_TIMEOUT, env=env)  # noqa: S607 - git from PATH, as in CI
+        done = subprocess.run(["git", "-C", str(root), *args], input=stdin, capture_output=True, check=True, timeout=_TIMEOUT, env=_env(env))  # noqa: S607 - git from PATH, as in CI
     except subprocess.CalledProcessError as error:
         msg = f"git {' '.join(args)} failed: {error.stderr.decode(errors='replace').strip()}"
         raise GitError(msg) from error
@@ -65,6 +72,52 @@ def at_ref(root: Path, ref: str) -> dict[str, str]:
 
 def head_commit(root: Path) -> str:
     return _git(root, "rev-parse", "HEAD").decode().strip()
+
+
+def is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
+    """Whether `descendant` contains `ancestor`. False for a commit this clone does not have."""
+    done = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", ancestor, descendant], capture_output=True, check=False, timeout=_TIMEOUT, env=_env())  # noqa: S607 - see _git
+    return done.returncode == 0
+
+
+def remote_branch(root: Path, remote: str, branch: str) -> str | None:
+    """Fetch a branch from the remote and return its commit, or None if the remote has no such branch."""
+    listed = _git(root, "ls-remote", "--heads", remote, f"refs/heads/{branch}").decode().split()
+    if not listed:
+        return None
+    _git(root, "fetch", "--quiet", "--no-tags", remote, f"refs/heads/{branch}")
+    return listed[0]
+
+
+def tree_of(root: Path, commit: str) -> str:
+    return _git(root, "rev-parse", f"{commit}^{{tree}}").decode().strip()
+
+
+def commit_files(root: Path, files: Mapping[str, str], *, parent: str | None, message: str) -> str:
+    """A commit whose tree is exactly `files`, on top of `parent`, made with git's plumbing: neither the worktree nor
+    the index is touched, so it works in any checkout. Returns the new commit."""
+    with tempfile.TemporaryDirectory() as tmp:
+        blobs = Path(tmp) / "blobs"
+        names = sorted(files)
+        paths = []
+        for index, name in enumerate(names):
+            path = blobs / str(index)
+            path.parent.mkdir(exist_ok=True)
+            path.write_bytes(files[name].encode(errors="surrogateescape"))
+            paths.append(str(path))
+        shas = _git(root, "hash-object", "-w", "--stdin-paths", stdin="\n".join(paths).encode()).decode().split() if paths else []
+        index_env = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
+        entries = "".join(f"100644 {sha}\t{name}\n" for sha, name in zip(shas, names, strict=True))
+        _git(root, "update-index", "--add", "--index-info", stdin=entries.encode(), env=index_env)
+        tree = _git(root, "write-tree", env=index_env).decode().strip()
+    identity = {"GIT_AUTHOR_NAME": "berth publish", "GIT_AUTHOR_EMAIL": "berth-publish@localhost"}
+    identity |= {"GIT_COMMITTER_NAME": identity["GIT_AUTHOR_NAME"], "GIT_COMMITTER_EMAIL": identity["GIT_AUTHOR_EMAIL"]}
+    return _git(root, "commit-tree", tree, *(["-p", parent] if parent is not None else []), "-m", message, env=identity).decode().strip()
+
+
+def push(root: Path, remote: str, commit: str, branch: str) -> None:
+    """Push a commit to a branch. Not forced: if someone else moved the branch since it was read, this fails."""
+    _git(root, "push", "--quiet", remote, f"{commit}:refs/heads/{branch}")
 
 
 def changed_paths(base: Tree, head: Tree) -> list[str]:

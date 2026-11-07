@@ -24,10 +24,18 @@ steps:
     displayName: Unit tests
 
   - script: uv run berth check
-    displayName: Specs valid; rendered/ and schemas up to date
+    displayName: Specs valid and render; schemas up to date
 
   - script: scripts/validate-rendered.sh
     displayName: Kubernetes schemas on everything rendered, for this Kubernetes version and the next
+
+  # Rendered with this pull request's own berth, so a change to the renderer shows what it does to every app.
+  - script: |
+      set -euo pipefail
+      git fetch --no-tags origin main
+      uv run berth diff --base origin/main --out "$(Agent.TempDirectory)/rendered.diff"
+      echo "##vso[task.uploadfile]$(Agent.TempDirectory)/rendered.diff"
+    displayName: What the change does to the rendered output (diff attached to the run)
 
   - script: scripts/validate-software.sh "$(Agent.TempDirectory)/software-head"
     displayName: Platform software charts render and pass schemas

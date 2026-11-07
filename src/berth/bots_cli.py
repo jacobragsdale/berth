@@ -124,7 +124,7 @@ def run(cmd: Command, platform_of: Callable[[Path, TextIO], Fleet | None], out: 
             if plan is None:
                 return 1
             paths = apply(cmd.root, fleet, plan, cmd.app)
-            out.writelines(f"{path.relative_to(cmd.root)}: sizes changed; run `berth render`\n" for path in paths)
+            out.writelines(f"{path.relative_to(cmd.root)}: sizes changed\n" for path in paths)
             if cmd.markdown is not None:
                 cmd.markdown.write_text(rightsize.markdown(plan, cmd.app))
             return 0

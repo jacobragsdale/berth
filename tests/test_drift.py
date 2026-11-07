@@ -1,14 +1,30 @@
-"""The decisions behind `berth deploy` and `berth drift`, on facts shaped like kubectl's output."""
+"""The decisions behind `berth deploy` and `berth drift`, on facts shaped like the API server's answers."""
 
-import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from support import fleet
 
-from berth.drift import BreakGlass, NamespaceDrift, Report, changed_objects, field_paths, hand_changes, prune_plan, removal_patch, slack, text, unmanaged
-from berth.kube import ManagedFields, ObjectRef
-from berth.operate import Target, select
+from berth.drift import (
+    SUPERSEDED_AT,
+    BreakGlass,
+    NamespaceDrift,
+    Report,
+    configmaps_used,
+    field_paths,
+    hand_changes,
+    missing,
+    object_diff,
+    prune_plan,
+    removal_patch,
+    slack,
+    superseded,
+    text,
+    unmanaged,
+)
+from berth.kube import ManagedFields, ObjectRef, rollout_state
+from berth.operate import DeployOptions, Outcome, Results, Seen, State, Target, decide
 
 NOW = datetime(2026, 11, 9, 14, tzinfo=UTC)
 BERTH = {"app.kubernetes.io/managed-by": "berth"}
@@ -19,7 +35,7 @@ SET_ENV: dict[str, object] = {"f:spec": {"f:template": {"f:spec": {"f:containers
 
 def ref(kind: str, name: str, **fields: object) -> ObjectRef:
     """An object in ledger-dev, labelled as berth's unless `labels` says otherwise."""
-    return replace(ObjectRef(kind, name, "ledger-dev", BERTH, {}, owned=False), **fields)
+    return replace(ObjectRef(kind, name, "ledger-dev", BERTH, {}, owned=False, api_version="v1"), **fields)
 
 
 def test_an_element_added_as_a_whole_is_one_path() -> None:
@@ -54,6 +70,7 @@ def test_prune_removes_only_what_berth_made_and_never_data() -> None:
     live = [
         ref("ConfigMap", "ledger-config-old"),
         ref("ConfigMap", "ledger-config-new"),
+        ref("ConfigMap", "ledger-config-1234", labels=BERTH | VERSIONED),  # retired by `superseded`, not pruned
         ref("PersistentVolumeClaim", "ledger-api-data"),
         ref("ConfigMap", "kept", annotations={"berth.contoso.io/keep": "true"}),
         ref("ConfigMap", "hand-made", labels={}),
@@ -74,25 +91,32 @@ def test_unmanaged_objects_exclude_what_kubernetes_and_controllers_make() -> Non
     assert [r.name for r in unmanaged(live)] == ["tmp-fix"]
 
 
-def test_changed_objects_are_read_from_kubectl_diff_file_names() -> None:
-    diff = (
-        "diff -u -N /tmp/LIVE-1/apps.v1.Deployment.ledger-dev.ledger-api /tmp/MERGED-1/apps.v1.Deployment.ledger-dev.ledger-api\n"
-        "--- /tmp/LIVE-1/...\n"
-        "diff -u -N /tmp/LIVE-1/v1.ConfigMap.ledger-dev.ledger-config.v2 /tmp/MERGED-1/v1.ConfigMap.ledger-dev.ledger-config.v2\n"
-    )
-    assert changed_objects(diff, "ledger-dev") == ["Deployment/ledger-api", "ConfigMap/ledger-config.v2"]
+def test_an_object_diff_ignores_what_the_server_keeps_for_itself() -> None:
+    live = {"kind": "Deployment", "metadata": {"name": "api", "resourceVersion": "7", "managedFields": [{}]}, "spec": {"replicas": 4}, "status": {"replicas": 4}}
+    same = {"kind": "Deployment", "metadata": {"name": "api", "resourceVersion": "9"}, "spec": {"replicas": 4}}
+    wanted = {"kind": "Deployment", "metadata": {"name": "api"}, "spec": {"replicas": 1}}
+    assert object_diff("Deployment/api", live, same) == ""
+    changed = object_diff("Deployment/api", live, wanted)
+    assert "-  replicas: 4" in changed
+    assert "+  replicas: 1" in changed
+    assert object_diff("Deployment/api", None, wanted).startswith("--- live/Deployment/api")
+
+
+def test_missing_objects_are_what_git_renders_and_the_cluster_lacks() -> None:
+    rendered = [{"kind": "Namespace", "metadata": {"name": "ledger-dev"}}, {"kind": "Deployment", "metadata": {"name": "ledger-api"}}, {"kind": "Service", "metadata": {"name": "api"}}]
+    assert missing(rendered, [ref("Service", "api")]) == ["Deployment/ledger-api"]
 
 
 def test_break_glass_round_trips_and_expires() -> None:
     mark = BreakGlass(by="alice.ng@contoso.com", reason="load test", until=NOW + timedelta(hours=2))
-    assert BreakGlass.decode(mark.encode()) == mark
+    assert BreakGlass.from_data(mark.data()) == mark
     assert mark.active(NOW)
     assert not mark.active(NOW + timedelta(hours=3))
 
 
-@pytest.mark.parametrize("value", ["not json", json.dumps({"by": "x"}), json.dumps({"until": "2026-11-09T14:00:00"})])  # the last has no time zone
-def test_a_malformed_break_glass_mark_is_ignored(value: str) -> None:
-    assert BreakGlass.decode(value) is None
+@pytest.mark.parametrize("data", [{}, {"by": "x"}, {"until": "2026-11-09T14:00:00"}, {"until": "soon"}])  # the third has no time zone
+def test_a_malformed_break_glass_mark_is_ignored(data: dict[str, object]) -> None:
+    assert BreakGlass.from_data(data) is None
 
 
 def test_the_report_counts_and_explains_each_namespace_that_needs_attention() -> None:
@@ -117,25 +141,100 @@ def test_an_in_sync_report_still_says_it_ran() -> None:
     assert text(Report("aks-prod", NOW, (NamespaceDrift("ledger-prod", "ledger", "prod"),))) == "berth drift on aks-prod, 2026-11-09 14:00 UTC: 1 in sync, 0 need attention\n"
 
 
-TARGETS = [Target("ledger", "dev", "ledger-dev"), Target("ledger", "qa", "ledger-qa"), Target("payments-api", "dev", "payments-api-dev")]
+FLEET = fleet()
+OPTIONS = DeployOptions(commit="c" * 40, now=NOW)
+
+
+def _target(env: str, digest: str = "new") -> Target:
+    return Target("demo", env, f"demo-{env}", f"k8s/aks-qa/demo-{env}/manifests.yaml", digest)
+
+
+def _seen(env: str, digest: str | None = "old", *, commit: str | None = None, mark: BreakGlass | None = None) -> Seen:
+    annotations = {"berth.contoso.io/deployed-digest": digest} if digest is not None else {}
+    annotations |= {"berth.contoso.io/deployed-commit": commit} if commit is not None else {}
+    namespace = ObjectRef("Namespace", f"demo-{env}", None, BERTH, annotations, owned=False)
+    return Seen({namespace.name: namespace}, {namespace.name: mark} if mark is not None else {}, {})
+
+
+def _decided(target: Target, seen: Seen, outcomes: dict[tuple[str, str], Outcome] | None = None, options: DeployOptions = OPTIONS) -> State | None:
+    found = decide(target, seen, outcomes or {}, FLEET, options)
+    return None if found is None else found.state
+
+
+def test_a_namespace_that_runs_what_git_renders_is_left_alone() -> None:
+    assert _decided(_target("dev", "same"), _seen("dev", "same")) is State.UNCHANGED
+    assert _decided(_target("dev", "new"), _seen("dev", "old")) is None  # deploy it
+    assert _decided(_target("dev", "new"), Seen({}, {}, {})) is None  # a new namespace
+    assert _decided(_target("dev", "same"), _seen("dev", "same"), options=replace(OPTIONS, revert=True)) is None  # reverting reapplies
+
+
+@pytest.mark.parametrize(("source", "held"), [(State.FAILED, True), (State.HELD, True), (State.DEPLOYED, False), (State.UNCHANGED, False), (State.SKIPPED, False)])
+def test_an_environment_is_held_while_the_one_it_promotes_from_failed(source: State, held: bool) -> None:  # noqa: FBT001 - parametrized expectation
+    outcomes = {("demo", "qa"): Outcome(app="demo", env="qa", state=source)}
+    assert (_decided(_target("prod"), _seen("prod"), outcomes) is State.HELD) is held
+    assert _decided(_target("prod"), _seen("prod"), {("other", "qa"): Outcome(app="other", env="qa", state=State.FAILED)}) is None  # another app never holds this one
+
+
+def test_break_glass_and_newer_commits_are_skipped() -> None:
+    mark = BreakGlass(by="alice", reason="incident", until=NOW + timedelta(hours=1))
+    assert _decided(_target("dev"), _seen("dev", mark=mark)) is State.SKIPPED
+    assert _decided(_target("dev"), _seen("dev", mark=replace(mark, until=NOW - timedelta(hours=1)))) is None  # expired
+    assert _decided(_target("dev"), _seen("dev", mark=mark), options=replace(OPTIONS, include_break_glass=True)) is None
+    newer = replace(OPTIONS, newer=lambda commit: commit == "d" * 40)
+    assert _decided(_target("dev"), _seen("dev", commit="d" * 40), options=newer) is State.SKIPPED
+    assert _decided(_target("dev"), _seen("dev", commit="e" * 40), options=newer) is None
 
 
 @pytest.mark.parametrize(
-    ("app", "env", "changed", "namespaces", "platform"),
+    ("platform", "states", "code"),
+    [("deployed", [State.DEPLOYED, State.UNCHANGED, State.SKIPPED], 0), ("deployed", [State.DEPLOYED, State.HELD], 2), ("failed", [], 1), ("skipped", [State.FAILED], 2)],
+)
+def test_the_exit_code_separates_a_failed_platform_from_failed_apps(platform: str, states: list[State], code: int) -> None:
+    namespaces = {f"app{i}-dev": Outcome(app=f"app{i}", env="dev", state=state) for i, state in enumerate(states)}
+    results = Results.model_validate({"cluster": "aks-qa", "commit": "c", "platform": platform, "namespaces": namespaces})
+    assert results.exit_code == code
+    assert Results.model_validate_json(results.model_dump_json()) == results
+
+
+VERSIONED = {"berth.contoso.io/versioned": "true"}
+
+
+def test_superseded_settings_are_noted_then_deleted_after_the_grace_period() -> None:
+    def versioned(name: str, since: datetime | None = None) -> ObjectRef:
+        return ref("ConfigMap", name, labels=BERTH | VERSIONED, annotations={SUPERSEDED_AT: since.isoformat()} if since is not None else {})
+
+    live = [
+        versioned("cfg-current"),
+        versioned("cfg-just-replaced"),
+        versioned("cfg-replaced-last-week", NOW - timedelta(days=8)),
+        versioned("cfg-replaced-yesterday", NOW - timedelta(days=1)),
+        versioned("cfg-back-again", NOW - timedelta(days=30)),  # a revert rendered it again
+        ref("ConfigMap", "hand-made", labels={}),
+    ]
+    plan = superseded(live, {"cfg-current", "cfg-back-again"}, NOW)
+    assert [item.name for item in plan.mark] == ["cfg-just-replaced"]
+    assert [item.name for item in plan.unmark] == ["cfg-back-again"]
+    assert [item.name for item in plan.delete] == ["cfg-replaced-last-week"]
+
+
+def test_a_config_map_a_live_workload_names_counts_as_in_use() -> None:
+    template = {"template": {"spec": {"containers": [{"envFrom": [{"configMapRef": {"name": "cfg-a"}}]}], "volumes": [{"name": "f", "configMap": {"name": "cfg-b"}}]}}}
+    deployment = ref("Deployment", "ledger-api", body={"spec": template})
+    assert configmaps_used([deployment, ref("Service", "api", body={"spec": template})]) == {"cfg-a", "cfg-b"}
+
+
+@pytest.mark.parametrize(
+    ("status", "done", "why"),
     [
-        (None, None, None, ["ledger-dev", "ledger-qa", "payments-api-dev"], True),
-        ("ledger", None, None, ["ledger-dev", "ledger-qa"], False),
-        ("ledger", "qa", None, ["ledger-qa"], False),
-        (None, None, ["rendered/k8s/aks-qa/ledger-dev/manifests.yaml", "apps/ledger/dev.yaml"], ["ledger-dev"], False),
-        (None, None, ["rendered/k8s/aks-qa/_platform/platform.yaml"], [], True),
-        (None, None, ["platform/software/envoy-gateway.yaml"], [], True),
-        (None, None, ["rendered/k8s/aks-prod/ledger-prod/manifests.yaml"], [], False),
+        ({"observedGeneration": 2, "replicas": 2, "updatedReplicas": 2, "availableReplicas": 2}, True, ""),
+        ({"observedGeneration": 1, "replicas": 2, "updatedReplicas": 2, "availableReplicas": 2}, False, "waiting for the Deployment controller"),
+        ({"observedGeneration": 2, "replicas": 3, "updatedReplicas": 2, "availableReplicas": 2}, False, "1 old pods still running"),
+        ({"observedGeneration": 2, "replicas": 2, "updatedReplicas": 2, "availableReplicas": 1}, False, "1 of 2 new pods ready"),
+        ({"observedGeneration": 2, "conditions": [{"type": "Progressing", "reason": "ProgressDeadlineExceeded", "message": "too slow"}]}, False, "failed: too slow"),
     ],
 )
-def test_a_deploy_selects_one_app_what_changed_or_everything(app: str | None, env: str | None, changed: list[str] | None, namespaces: list[str], platform: bool) -> None:  # noqa: FBT001 - a parametrized expectation
-    selection = select(TARGETS, "aks-qa", app=app, env=env, changed=changed)
-    assert [t.namespace for t in selection.targets] == namespaces
-    assert selection.platform is platform
+def test_rollouts_finish_by_the_rules_kubectl_uses(status: dict[str, object], done: bool, why: str) -> None:  # noqa: FBT001 - parametrized expectation
+    assert rollout_state({"metadata": {"generation": 2}, "spec": {"replicas": 2}, "status": status}) == (done, why)
 
 
 def test_a_change_adopted_into_git_is_no_longer_by_hand() -> None:

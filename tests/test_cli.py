@@ -29,19 +29,17 @@ def git(root: Path, *args: str) -> None:
 
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
-    """A valid deploy repo (specs, schemas and rendered output agree) with one commit on main."""
+    """A valid deploy repo (specs and schemas agree) with one commit on main. Nothing rendered is committed."""
     for part in ("platform", "apps/payments-api", "apps/ledger", "apps/customer-portal"):
         shutil.copytree(REPO / part, tmp_path / part)
+    shutil.copy(REPO / ".gitignore", tmp_path / ".gitignore")
     git(tmp_path, "init", "-q", "-b", "main")
-    assert berth("--root", str(tmp_path), "render")[0] == 0
     git(tmp_path, "add", ".")
     git(tmp_path, "commit", "-q", "-m", "base")
     return tmp_path
 
 
 def review(repo: Path, *argv: str) -> str:
-    """Render, as the author would before pushing, then review against main."""
-    assert berth("--root", str(repo), "render")[0] == 0
     return berth("--root", str(repo), "review", *argv)[1]
 
 
@@ -56,11 +54,47 @@ def test_check_passes_on_this_repository() -> None:
     assert (code, out.splitlines()[-1]) == (0, "ok: 7 apps, 20 app environments")
 
 
-def test_hand_edited_rendered_output_fails_the_gate(repo: Path) -> None:
-    edit(repo / "rendered/k8s/aks-prod/ledger-prod/manifests.yaml", "runAsNonRoot: true", "runAsNonRoot: false")
-    _, out = berth("--root", str(repo), "review", "--author", INFRA, "--approve", "platform.oncall@contoso.com")
-    assert "gate: failed" in out
-    assert "rendered/k8s/aks-prod/ledger-prod/manifests.yaml: stale" in out
+def test_a_change_to_berth_itself_passes_the_gate_with_a_platform_approver(repo: Path) -> None:
+    # The gate runs main's berth. It used to compare committed output with what main's renderer produces, so a renderer
+    # change could never pass. Nothing rendered is committed now: the change is judged as code, by the platform team.
+    (repo / "src/berth/render").mkdir(parents=True)
+    (repo / "src/berth/render/k8s.py").write_text("# a renderer change\n")
+    pending = review(repo, "--author", INFRA)
+    approved = review(repo, "--author", INFRA, "--approve", "platform.oncall@contoso.com")
+    assert "platform files: platform review" in pending
+    assert "gate: pending" in pending
+    assert "gate: succeeded" in approved
+    assert "note: this changes berth itself" in approved
+
+
+def test_rendering_writes_a_tree_git_ignores(repo: Path) -> None:
+    code, out = berth("--root", str(repo), "render")
+    assert code == 0
+    assert "into" in out
+    assert (repo / "rendered/k8s/aks-prod/ledger-prod/manifests.yaml").is_file()
+    status = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True, check=True).stdout  # noqa: S607
+    assert status == ""
+    assert "gate: succeeded" in review(repo, "--author", ALICE)  # nothing to review
+
+
+def test_render_will_not_write_over_a_directory_that_is_not_a_rendered_tree(repo: Path, tmp_path: Path) -> None:
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    (other / "notes.txt").write_text("mine\n")
+    code, out = berth("--root", str(repo), "render", "--out", str(other))
+    assert code == 1
+    assert "not a rendered tree" in out
+    assert (other / "notes.txt").read_text() == "mine\n"
+
+
+def test_diff_shows_what_a_change_does_to_the_rendered_output(repo: Path, tmp_path: Path) -> None:
+    (repo / "apps/payments-api/prod.yaml").write_text((repo / "apps/payments-api/prod.yaml").read_text() + "config:\n  LOG_LEVEL: warn\n")
+    code, out = berth("--root", str(repo), "diff", "--base", "main", "--out", str(tmp_path / "rendered.diff"))
+    assert code == 0
+    assert "2 rendered files change against main" in out  # the manifests, and the DAG that names the new ConfigMap
+    assert "k8s/aks-prod/payments-api-prod/manifests.yaml" in out
+    assert "airflow/prod/payments-api__settlement.py" in out
+    assert "+  LOG_LEVEL: warn" in (tmp_path / "rendered.diff").read_text()
 
 
 def test_a_new_caller_needs_the_called_apps_owners(repo: Path) -> None:
