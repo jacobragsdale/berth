@@ -150,7 +150,7 @@ def _unmet(req: Requirement, proposal: Proposal, platform: Platform) -> list[str
     approvers = set(platform.platform_approvers) - {author}
     pool = set(req.owners) - {author}
     tier = req.tier
-    if tier is Tier.AUTO and author not in req.owners and author != platform.release_bot:
+    if tier is Tier.AUTO and author not in req.owners and author not in _bots(platform):
         tier = Tier.OWNER  # auto means "an owner may self-merge", not "anyone may"
     unmet: list[str] = []
     if tier >= Tier.OWNER and req.app is not None and not approved & pool:
@@ -160,13 +160,31 @@ def _unmet(req: Requirement, proposal: Proposal, platform: Platform) -> list[str
     return unmet
 
 
+def _bots(platform: Platform) -> set[str]:
+    """Bot identities that may merge an auto-tier change on their own, within what each may change."""
+    return {bot for bot in (platform.release_bot, platform.rightsizing_bot) if bot is not None}
+
+
+def _is_size(path: str) -> bool:
+    return matches("services.*.size", path) or matches("workflows.*.tasks.*.size", path)
+
+
+def _bot_overstep(reqs: list[Requirement], proposal: Proposal, platform: Platform) -> Decision | None:
+    """A bot may change one kind of field and nothing else: versions for the release bot, sizes for rightsizing."""
+    paths = {f.change.path for r in reqs for f in r.findings}
+    if proposal.author == platform.release_bot and (stray := sorted(p for p in paths if p != "version")):
+        return Decision("failed", (f"the release bot may only change versions, but this changes {', '.join(stray)}",))
+    if proposal.author == platform.rightsizing_bot and (stray := sorted(p for p in paths if not _is_size(p))):
+        return Decision("failed", (f"the rightsizing bot may only change sizes, but this changes {', '.join(stray)}",))
+    return None
+
+
 def decide(reqs: list[Requirement], proposal: Proposal, platform: Platform, now: datetime) -> Decision:
     """The merge gate. `failed` blocks until a vote or the change itself changes; `pending` waits for approvals."""
     approvers = set(platform.platform_approvers)
-    if proposal.author == platform.release_bot:
-        stray = sorted({f.change.path for r in reqs for f in r.findings if f.change.path != "version"})
-        if stray:
-            return Decision("failed", (f"the release bot may only change versions, but this changes {', '.join(stray)}",))
+    overstep = _bot_overstep(reqs, proposal, platform)
+    if overstep is not None:
+        return overstep
     rejected = [f"{r.app or 'platform files'}: rejected by {_names(who)}" for r in reqs if (who := proposal.votes.rejected & (set(r.owners) | approvers))]
     if rejected:
         return Decision("failed", tuple(rejected))

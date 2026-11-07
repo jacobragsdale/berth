@@ -1,0 +1,9 @@
+# yaml-language-server: $schema=schema/mirrors.schema.json
+# Upstream images copied into the registry for third-party apps, and kept current by the mirror bot
+# (pipelines/mirror.yml): it imports the newest tag on each track and opens the dev release pull request for every
+# app whose image is the target. Every app with an image under mirror/ needs an entry here.
+mirrors:
+  redis:
+    source: docker.io/library/redis
+    target: mirror/redis
+    track: "8.2"  # the newest 8.2.x; moving to 8.3 is a reviewed change to this line

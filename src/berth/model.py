@@ -5,6 +5,8 @@
 """
 
 import re
+from decimal import Decimal
+from string import Template
 from typing import Annotated, Literal, Self
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -245,9 +247,14 @@ class ServiceOverlay(Spec):
         return self
 
 
+class TaskOverlay(Spec):
+    size: SizeName | None = None
+
+
 class WorkflowOverlay(Spec):
     schedule: Cron | None = None
     enabled: bool = True
+    tasks: dict[PartName, TaskOverlay] = Field(default_factory=dict)
 
 
 class EnvFile(Spec):
@@ -356,12 +363,53 @@ class Freeze(Spec):
         return self
 
 
+def _check_query(value: str) -> str:
+    missing = sorted({"service", "env"} - {m[1] or m[2] for m in Template.pattern.finditer(value) if m[1] or m[2]})
+    if missing:
+        msg = f"a Datadog query needs ${{service}} and ${{env}}; missing {', '.join(missing)}"
+        raise ValueError(msg)
+    return value
+
+
+DatadogQuery = Annotated[str, AfterValidator(_check_query)]
+Money = Annotated[Decimal, Field(ge=0, max_digits=10, decimal_places=2)]
+
+
+class Rightsizing(Spec):
+    """How the weekly rightsizing bot reads Datadog and turns usage into a size from the menu.
+
+    Queries are Datadog metric queries with `$service` and `$env`, grouped by pod. Check the metric names against
+    your account: they differ between Datadog's Kubernetes integrations.
+    """
+
+    days: int = Field(default=14, ge=7, le=60)  # how far back to look
+    min_days: int = Field(default=7, ge=1)  # less data than this and the bot leaves the size alone
+    cpu_percentile: float = Field(default=0.95, gt=0, le=1)  # CPU is forgiving: a high percentile, not the peak
+    cpu_margin: float = Field(default=1.25, ge=1)
+    memory_margin: float = Field(default=1.3, ge=1)  # memory is not: the peak, plus headroom
+    cpu_query: DatadogQuery = "max:kubernetes.cpu.usage.total{service:$service,env:$env} by {pod_name}"  # nanocores
+    memory_query: DatadogQuery = "max:kubernetes.memory.working_set{service:$service,env:$env} by {pod_name}"  # bytes
+    oom_query: DatadogQuery = "sum:kubernetes_state.container.status_report.count.terminated{service:$service,env:$env,reason:oomkilled}"
+    price_per_vcpu_month: Money = Decimal("25.00")  # for the savings estimate in pull requests only
+    price_per_gib_month: Money = Decimal("3.50")
+
+    @model_validator(mode="after")
+    def _enough_days(self) -> Self:
+        if self.min_days > self.days:
+            msg = "min_days cannot be more than days"
+            raise ValueError(msg)
+        return self
+
+
 class Platform(Spec):
     registry: str
     tenant_id: str
     repo_url: HttpsUrl  # this repository, for links to commits
     platform_approvers: tuple[Identity, ...] = Field(min_length=1)
     release_bot: Annotated[str, StringConstraints(min_length=1)]
+    # Identity whose pull requests may change sizes only: the weekly rightsizing bot.
+    rightsizing_bot: Annotated[str, StringConstraints(min_length=1)] | None = None
+    rightsizing: Rightsizing = Field(default_factory=Rightsizing)
     # Entra groups whose members may change app namespaces with kubectl, for break-glass. They get `edit` there.
     kubectl_writers: tuple[EntraObjectId, ...] = ()
     max_replicas_without_review: int = Field(ge=1)
@@ -432,3 +480,17 @@ class Rule(Spec):
 
 class ReviewPolicy(Spec):
     rules: tuple[Rule, ...] = Field(min_length=1)
+
+
+class Mirror(Spec):
+    """An upstream image kept current in the registry, for third-party apps (`image: <target>`)."""
+
+    source: Annotated[str, StringConstraints(pattern=r"^[a-z0-9.-]+(:\d+)?(/[a-z0-9._-]+)+$")]  # e.g. docker.io/library/redis
+    target: Annotated[str, StringConstraints(pattern=r"^mirror(/[a-z0-9._-]+)+$")]  # the repository in the registry
+    # Which releases to follow: "8.2" means the newest 8.2.x, "8" the newest 8.x. Tags are plain X.Y.Z plus suffix.
+    track: Annotated[str, StringConstraints(pattern=r"^\d+(\.\d+)?$")]
+    suffix: Annotated[str, StringConstraints(pattern=r"^(-[a-z0-9.]+)?$")] = ""  # a tag variant such as "-alpine"
+
+
+class Mirrors(Spec):
+    mirrors: dict[Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9-]{0,40}$")], Mirror] = Field(default_factory=dict)

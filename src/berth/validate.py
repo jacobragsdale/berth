@@ -1,6 +1,6 @@
 """Checks that need more than one file: references between apps, platform menus, and what each orchestrator can express."""
 
-from berth.fleet import SOFTWARE_DIR, Fleet, Instance
+from berth.fleet import MIRRORS_FILE, SOFTWARE_DIR, Fleet, Instance
 from berth.render.controlm import controlm_when
 from berth.render.k8s import gateway_certificates
 from berth.render.software import releases, values
@@ -28,7 +28,23 @@ def problems(fleet: Fleet) -> list[str]:
                     controlm_when(workflow.schedule)
                 except ValueError as error:
                     found.append(f"{where}: workflows.{name}: {error}")
-    return found + _hostname_problems(fleet) + _software_problems(fleet)
+    return found + _hostname_problems(fleet) + _software_problems(fleet) + _mirror_problems(fleet)
+
+
+def _mirror_problems(fleet: Fleet) -> list[str]:
+    """Every third-party image has a mirror, so something keeps it current; no two mirrors fill one target."""
+    targets: dict[str, str] = {}
+    found: list[str] = []
+    for name, mirror in sorted(fleet.mirrors.mirrors.items()):
+        other = targets.setdefault(mirror.target, name)
+        if other != name:
+            found.append(f"{MIRRORS_FILE}: mirrors.{name}: target {mirror.target} is already filled by {other}")
+    found.extend(
+        f"apps/{name}/app.yaml: image {source.spec.image} has no entry in {MIRRORS_FILE}, so nothing keeps it current"
+        for name, source in sorted(fleet.apps.items())
+        if source.spec.image is not None and source.spec.image.startswith("mirror/") and source.spec.image not in targets
+    )
+    return found
 
 
 def _hostname_problems(fleet: Fleet) -> list[str]:

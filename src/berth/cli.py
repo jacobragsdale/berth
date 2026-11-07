@@ -4,21 +4,29 @@ import argparse
 import contextlib
 import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO, assert_never
 
-from berth import cluster_cli, diff, edit, explain, gitio, notify, report, validate
+from berth import bots_cli, cluster_cli, diff, edit, explain, gitio, notify, report, validate
 from berth.ado import Ado, AdoSettings, http_transport
+from berth.datadog import DatadogError
 from berth.fleet import Fleet, LoadError, load
 from berth.kube import KubeError
-from berth.model import App, EnvFile, Platform, Software
+from berth.model import App, EnvFile, Mirrors, Platform, Software
+from berth.registry import RegistryError
 from berth.render import ROOT, render, stale
 from berth.review import Decision, Proposal, Requirement, Votes, classify, decide, requirements
 
-SCHEMAS = {"platform/schema/app.schema.json": App, "platform/schema/env.schema.json": EnvFile, "platform/schema/platform.schema.json": Platform, "platform/schema/software.schema.json": Software}
+SCHEMAS = {
+    "platform/schema/app.schema.json": App,
+    "platform/schema/env.schema.json": EnvFile,
+    "platform/schema/platform.schema.json": Platform,
+    "platform/schema/software.schema.json": Software,
+    "platform/schema/mirrors.schema.json": Mirrors,
+}
 
 
 @dataclass(frozen=True)
@@ -92,7 +100,7 @@ class Images:
     base: str | None
 
 
-type Command = Check | Render | Review | Gate | Release | Promote | New | Schema | Explain | Images | cluster_cli.Command
+type Command = Check | Render | Review | Gate | Release | Promote | New | Schema | Explain | Images | cluster_cli.Command | bots_cli.Command
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -136,6 +144,7 @@ def _parser() -> argparse.ArgumentParser:
     images_cmd = sub.add_parser("images", help="list the image references (registry/repository@digest) the specs deploy")
     images_cmd.add_argument("--base", help="only images that are new relative to this git ref")
     cluster_cli.add_commands(sub)
+    bots_cli.add_commands(sub)
     return parser
 
 
@@ -143,8 +152,10 @@ def parse(argv: Sequence[str]) -> Command:  # noqa: PLR0911 - one return per com
     parser = _parser()
     ns = parser.parse_args(argv)
     root = Path(ns.root)
-    if ns.command in cluster_cli.COMMANDS:
-        return cluster_cli.parse(ns, root, parser.error)
+    delegated: dict[str, Callable[[argparse.Namespace, Path, Callable[[str], object]], Command]] = dict.fromkeys(cluster_cli.COMMANDS, cluster_cli.parse)
+    delegated |= dict.fromkeys(bots_cli.COMMANDS, bots_cli.parse)
+    if (handler := delegated.get(ns.command)) is not None:
+        return handler(ns, root, parser.error)
     match ns.command:
         case "check":
             return Check(root)
@@ -369,6 +380,8 @@ def run(cmd: Command, out: TextIO, now: datetime) -> int:  # noqa: PLR0911, PLR0
                 return _list_images(cmd, out)
             case cluster_cli.Deploy() | cluster_cli.Drift() | cluster_cli.BreakGlassStart() | cluster_cli.BreakGlassEnd():
                 return cluster_cli.run(cmd, _platform_of, _checked, out, now)
+            case bots_cli.RightsizePlan() | bots_cli.RightsizeApply() | bots_cli.MirrorPlan():
+                return bots_cli.run(cmd, _platform_of, out, now)
             case Schema():
                 schemas = _schemas()
                 stale_paths = [path for path, text in schemas.items() if not (cmd.root / path).is_file() or (cmd.root / path).read_text() != text]
@@ -382,7 +395,7 @@ def run(cmd: Command, out: TextIO, now: datetime) -> int:  # noqa: PLR0911, PLR0
                 return 0
             case _:
                 assert_never(cmd)
-    except (edit.EditError, gitio.GitError, KubeError, notify.NotifyError) as error:
+    except (edit.EditError, gitio.GitError, KubeError, notify.NotifyError, DatadogError, RegistryError) as error:
         out.write(f"error: {error}\n")
         return 1
 

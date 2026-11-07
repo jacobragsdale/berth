@@ -74,6 +74,33 @@ def dump(document: Mapping[str, object]) -> str:
     return buffer.getvalue()
 
 
+def set_path(text: str, path: tuple[str, ...], value: str, *, source: str) -> str:
+    """Set one nested scalar, creating the mappings on the way, and keep the file's comments and layout."""
+    yaml = _yaml()
+    try:
+        data: object = yaml.load(text)
+    except Exception as error:  # see load()
+        msg = f"{source}: not valid YAML: {error}"
+        raise YamlError(msg) from error
+    if not isinstance(data, CommentedMap):
+        msg = f"{source}: expected a mapping at the top level"
+        raise YamlError(msg)
+    node = data
+    for key in path[:-1]:
+        child = node.get(key)
+        if child is None:
+            child = CommentedMap()
+            node[key] = child
+        if not isinstance(child, CommentedMap):
+            msg = f"{source}: {key} is not a mapping"
+            raise YamlError(msg)
+        node = child
+    node[path[-1]] = value
+    buffer = StringIO()
+    yaml.dump(data, buffer)
+    return buffer.getvalue()
+
+
 def set_top_level(text: str, key: str, value: str, *, source: str) -> str:
     """Set one top-level scalar and keep the file's comments and layout, so a bot edit reads like a human one."""
     yaml = _yaml()

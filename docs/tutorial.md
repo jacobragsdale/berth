@@ -21,7 +21,7 @@ uv run berth check
 You should see:
 
 ```text
-ok: 6 apps, 17 app environments
+ok: 7 apps, 20 app environments
 ```
 
 The numbers count the apps already in the repository and the environments they run in. If your clone has more apps, the numbers in this tutorial's output will be larger. Everything else should match.
@@ -88,7 +88,7 @@ git status --short
 You should see:
 
 ```text
-rendered 33 files (1 changed)
+rendered 36 files (1 changed)
 ?? apps/quote-board/
 ?? rendered/k8s/aks-qa/quote-board-dev/
 ```
@@ -100,7 +100,7 @@ uv run berth check
 ```
 
 ```text
-ok: 7 apps, 18 app environments
+ok: 8 apps, 21 app environments
 ```
 
 ## See what you will get
@@ -211,7 +211,7 @@ uv run berth review --base HEAD --author nina.berg@contoso.com
 You should see:
 
 ```text
-rendered 33 files (1 changed)
+rendered 36 files (1 changed)
 quote-board: auto review
   dev  config.REFRESH_SECONDS  - -> 5  auto  application settings
 gate: succeeded
@@ -234,7 +234,7 @@ uv run berth review --base HEAD --author nina.berg@contoso.com
 On macOS, use `sed -i ''` instead of `sed -i`. You should see:
 
 ```text
-rendered 33 files (1 changed)
+rendered 36 files (1 changed)
 quote-board: platform review
   dev  services.api.size  s -> xl  platform  size xl needs platform review
 gate: pending
@@ -257,7 +257,7 @@ uv run berth review --base HEAD --author nina.berg@contoso.com
 You should see:
 
 ```text
-rendered 34 files (1 changed)
+rendered 37 files (1 changed)
 quote-board: platform review
   prod  environment  - -> added  platform  starting or stopping an app in an environment
 gate: pending
@@ -277,7 +277,7 @@ git switch main
 git branch -D tutorial
 ```
 
-`uv run berth check` should print `ok: 6 apps, 17 app environments` again.
+`uv run berth check` should print `ok: 7 apps, 20 app environments` again.
 
 ## Next steps
 

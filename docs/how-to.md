@@ -174,9 +174,47 @@ You need permission to import into the registry (the `AcrPush` role on `contosoa
        writable: [/data]
    ```
 
-4. Render and check. Anything the spec cannot express becomes an override, which needs a platform approver.
+4. Add the image to `platform/mirrors.yaml`, so the mirror bot keeps it current. `berth check` refuses an image under `mirror/` without an entry:
+
+   ```yaml
+   mirrors:
+     redis:
+       source: docker.io/library/redis
+       target: mirror/redis
+       track: "8.2"  # the newest 8.2.x
+   ```
+
+5. Render and check. Anything the spec cannot express becomes an override, which needs a platform approver.
+
+`apps/rates-cache/` is a worked example: Redis configured with a file, with no health path and a writable working directory.
 
 Databases holding data that matters are not run this way. Ask Azure or the DBA team for a managed one, and connect to it with a host in `config` and the password in `secrets`.
+
+## How to keep a third-party image current
+
+The mirror bot (`pipelines/mirror.yml`) runs every morning. For each entry in `platform/mirrors.yaml` it finds the newest upstream tag on the entry's `track`, copies it into ACR, and opens a dev release pull request for every app that runs an older tag. The pull request comes from the release bot, so it merges once the checks pass. Promote it to qa and prod as you would your own releases.
+
+- **Follow a newer line:** change `track` from `"8.2"` to `"8.3"` in a pull request. That is a platform-tier change, because a minor version can change behaviour.
+- **Follow a variant:** add `suffix: "-alpine"` to follow tags such as `8.2.11-alpine`. Release candidates and other suffixes are never taken.
+- **See what it would do:** `uv run berth mirror --plan-out plan.json` prints each pending update. It reads the public registries and changes nothing.
+
+## How to respond to a rightsizing pull request
+
+Every Monday the rightsizing bot (`pipelines/rightsize.yml`) compares each service's and task's size with what it used in Datadog over the last 14 days. Where another size from the menu fits better, it opens one pull request per app per environment. The description gives each change, the reason, the observed CPU (95th percentile) and peak memory, and an estimated monthly saving.
+
+- **In dev and qa** the pull request merges once the checks pass: the bot may change sizes only, and a size change there needs no approval.
+- **In prod** an owner approves it. Close it to keep the current size; the bot proposes again the next week if the numbers still say so.
+- **It never shrinks a workload that was killed for memory.** It proposes one size up instead.
+- **It leaves CPU alone for services that autoscale on CPU,** because the autoscaler's target is a percentage of the CPU request.
+- **It does nothing for a workload with less than seven days of data,** such as a new app.
+
+To see what it would propose without opening anything, run it with Datadog keys in the environment:
+
+```sh
+DD_API_KEY=... DD_APP_KEY=... uv run berth rightsize --env prod --app payments-api --plan-out plan.json
+```
+
+The bot writes sizes into environment files, such as `services.api.size` in `prod.yaml`, or `workflows.<name>.tasks.<task>.size` for a task. You can set those by hand the same way.
 
 ## How to change a setting
 
@@ -384,8 +422,15 @@ These have not been run against a real organisation. Treat each step as a checkl
 3. Create the pipeline `berth-deploy` from `pipelines/main.yml`, and Azure Pipelines environments `berth-aks-qa`, `berth-aks-prod`, `berth-controlm-dev`, `berth-controlm-qa` and `berth-controlm-prod`. Add business-hours checks on the prod environments if you want them.
 4. Create variable groups `berth-controlm-dev`, `berth-controlm-qa` and `berth-controlm-prod`, each holding `CTM_ENDPOINT` and a `CTM_TOKEN` issued by the Control-M team. Airflow needs nothing here: it reads `rendered/airflow/<env>/` from git with its own git connection.
 5. Create a variable group `berth-drift`, linked to Key Vault, holding `SLACK_WEBHOOK_URL`: an incoming webhook for the channel that should get the report.
-6. Grant each variable group pipeline permission to the pipeline that uses it only.
-7. Create the pipeline `berth-drift` from `pipelines/drift.yml`. It runs at 13:00 UTC every day.
+6. Create the pipeline `berth-drift` from `pipelines/drift.yml`. It runs at 13:00 UTC every day.
+7. For the rightsizing bot:
+   - create a variable group `berth-datadog` holding `DD_API_KEY`, `DD_APP_KEY` and `DD_SITE`;
+   - create a service connection `berth-rightsizing` for its identity, which must be `rightsizing_bot` in `platform.yaml` and may open pull requests;
+   - create the pipeline `berth-rightsize` from `pipelines/rightsize.yml`, which runs every Monday at 12:00 UTC.
+
+   First check the Datadog metric names in `platform.yaml`'s `rightsizing` against your account: run `berth rightsize` for one app and compare its numbers with Datadog's own graphs.
+8. For the mirror bot: give the `berth-release` connection's identity `AcrPush` on the registry, and create the pipeline `berth-mirror` from `pipelines/mirror.yml`, which runs every day at 06:00 UTC.
+9. Grant each variable group pipeline permission to the pipeline that uses it only.
 
 ## How to set up the gate in Azure DevOps
 

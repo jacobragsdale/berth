@@ -7,11 +7,12 @@ from pathlib import PurePosixPath
 from pydantic import ValidationError
 
 from berth import yamlio
-from berth.model import App, EnvFile, Environment, Override, Platform, ReviewPolicy, Service, Software, Spec, Workflow
+from berth.model import App, EnvFile, Environment, Mirrors, Override, Platform, ReviewPolicy, Service, Software, Spec, Workflow
 
 PLATFORM_FILE = "platform/platform.yaml"
 POLICY_FILE = "platform/review.yaml"
 SOFTWARE_DIR = "platform/software"
+MIRRORS_FILE = "platform/mirrors.yaml"
 APP_FILE = "app.yaml"
 
 type Tree = Mapping[str, str]
@@ -37,6 +38,7 @@ class Fleet:
     policy: ReviewPolicy
     apps: Mapping[str, AppSource]
     software: Mapping[str, Software]
+    mirrors: Mirrors
 
     def instances(self) -> Iterator["Instance"]:
         for name in sorted(self.apps):
@@ -119,9 +121,10 @@ def load(tree: Tree) -> Fleet:
         if source is not None:
             apps[name] = source
     software = _load_software(tree, platform, problems)
-    if problems:
+    mirrors = _parsed(Mirrors, tree, MIRRORS_FILE, problems) if MIRRORS_FILE in tree else Mirrors()
+    if problems or mirrors is None:
         raise LoadError(problems)
-    return Fleet(platform=platform, policy=policy, apps=apps, software=software)
+    return Fleet(platform=platform, policy=policy, apps=apps, software=software, mirrors=mirrors)
 
 
 def _directly_in(path: str, directory: str) -> bool:
@@ -181,6 +184,12 @@ def _load_app(name: str, paths: list[PurePosixPath], tree: Tree, platform: Platf
         path = f"{base}/{env}.yaml"
         problems.extend(f"{path}: services.{svc}: no service {svc!r} in app.yaml" for svc in sorted(set(overlay.services) - set(app.services)))
         problems.extend(f"{path}: workflows.{wf}: no workflow {wf!r} in app.yaml" for wf in sorted(set(overlay.workflows) - set(app.workflows)))
+        problems.extend(
+            f"{path}: workflows.{wf}.tasks.{task}: no task {task!r} in that workflow"
+            for wf, patch in sorted(overlay.workflows.items())
+            if wf in app.workflows
+            for task in sorted(set(patch.tasks) - set(app.workflows[wf].tasks))
+        )
         try:
             resolve(app, env, platform.environments[env], overlay)
         except ValidationError as error:
@@ -211,7 +220,11 @@ def resolve(app: App, env: str, environment: Environment, overlay: EnvFile) -> I
         if patch is not None and not patch.enabled:
             continue
         schedule = patch.schedule if patch is not None and patch.schedule is not None else workflow.schedule
-        workflows[name] = Workflow.model_validate(workflow.model_dump() | {"schedule": schedule})
+        tasks = {task: spec.model_dump() for task, spec in workflow.tasks.items()}
+        for task, task_patch in (patch.tasks if patch is not None else {}).items():
+            if task in tasks and task_patch.size is not None:
+                tasks[task] = tasks[task] | {"size": task_patch.size}
+        workflows[name] = Workflow.model_validate(workflow.model_dump() | {"schedule": schedule, "tasks": tasks})
 
     return Instance(
         app=app.name,

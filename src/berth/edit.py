@@ -36,6 +36,25 @@ def release(root: Path, app: str, env: str, version: str) -> Path:
     return path
 
 
+@dataclass(frozen=True)
+class Sized:
+    """Something with a size in one environment: `path` is ("services", name) or ("workflows", wf, "tasks", task)."""
+
+    app: str
+    env: str
+    path: tuple[str, ...]
+
+
+def resize(root: Path, platform: Platform, where: Sized, size: str) -> Path:
+    """Set a service's or task's size in one environment's file, keeping its comments."""
+    if size not in platform.sizes:
+        msg = f"unknown size {size!r} (sizes: {', '.join(platform.sizes)})"
+        raise EditError(msg)
+    target = _env_file(root, where.app, where.env)
+    target.write_text(yamlio.set_path(target.read_text(), (*where.path, "size"), size, source=str(target)))
+    return target
+
+
 def promote(root: Path, platform: Platform, app: str, env: str) -> tuple[Path, str]:
     environment = platform.environments.get(env)
     if environment is None or environment.promotes_from is None:

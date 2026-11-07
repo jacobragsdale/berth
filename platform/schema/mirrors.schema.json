@@ -1,0 +1,52 @@
+{
+  "$defs": {
+    "Mirror": {
+      "additionalProperties": false,
+      "description": "An upstream image kept current in the registry, for third-party apps (`image: <target>`).",
+      "properties": {
+        "source": {
+          "pattern": "^[a-z0-9.-]+(:\\d+)?(/[a-z0-9._-]+)+$",
+          "title": "Source",
+          "type": "string"
+        },
+        "target": {
+          "pattern": "^mirror(/[a-z0-9._-]+)+$",
+          "title": "Target",
+          "type": "string"
+        },
+        "track": {
+          "pattern": "^\\d+(\\.\\d+)?$",
+          "title": "Track",
+          "type": "string"
+        },
+        "suffix": {
+          "default": "",
+          "pattern": "^(-[a-z0-9.]+)?$",
+          "title": "Suffix",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "target",
+        "track"
+      ],
+      "title": "Mirror",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "mirrors": {
+      "patternProperties": {
+        "^[a-z][a-z0-9-]{0,40}$": {
+          "$ref": "#/$defs/Mirror"
+        }
+      },
+      "title": "Mirrors",
+      "type": "object"
+    }
+  },
+  "title": "Mirrors",
+  "type": "object"
+}

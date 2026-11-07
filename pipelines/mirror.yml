@@ -1,0 +1,53 @@
+# Every day: for each image in platform/mirrors.yaml, find the newest upstream tag on its track, copy it into ACR,
+# and open the dev release pull request for every app that runs an older one. It opens them as the release bot,
+# which may change versions only, so dev updates merge once the checks pass; qa and prod are promoted by people.
+#
+# Not yet run in Azure DevOps. Needs a service connection berth-release for the release bot's identity, with
+# AcrPush on the registry (to import) and permission to open pull requests.
+trigger: none
+pr: none
+schedules:
+  - cron: "0 6 * * *"
+    displayName: Daily mirror
+    branches:
+      include: [main]
+    always: true
+
+pool:
+  vmImage: ubuntu-24.04
+
+steps:
+  - checkout: self
+    persistCredentials: true
+  - template: templates/setup-uv.yml
+  - script: uv run berth mirror --plan-out "$(Agent.TempDirectory)/mirror.json"
+    displayName: Find newer upstream tags
+  - task: AzureCLI@2
+    displayName: Import into ACR and open the release pull requests
+    inputs:
+      azureSubscription: berth-release
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        registry=contosoacr
+        uv run python -c "
+        import sys
+        from berth.mirror import Plan
+        for u in Plan.model_validate_json(open(sys.argv[1]).read()).updates:
+            for app in u.apps:
+                print(u.source, u.target, u.tag, u.env, app)
+        " "$(Agent.TempDirectory)/mirror.json" | while read -r source target tag env app; do
+          az acr import --name "$registry" --source "$source:$tag" --image "$target:$tag" --force
+          digest=$(az acr repository show --name "$registry" --image "$target:$tag" --query digest -o tsv)
+          branch="mirror/$app/$tag"
+          git checkout -q -B "$branch" origin/main
+          uv run berth release "$app" --env "$env" --version "$tag@$digest"
+          uv run berth render
+          git add apps rendered
+          git -c user.name="berth release" -c user.email=berth-release@contoso.com commit -qm "release $app $tag to $env (upstream $source)"
+          git push -q -f origin "$branch"
+          az repos pr create --repository berth --source-branch "$branch" --target-branch main \
+            --title "release $app $tag to $env" --description "New upstream tag $source:$tag, copied to $target." \
+            --auto-complete true --delete-source-branch true
+        done

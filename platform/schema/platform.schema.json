@@ -239,6 +239,87 @@
       "title": "Proxy",
       "type": "object"
     },
+    "Rightsizing": {
+      "additionalProperties": false,
+      "description": "How the weekly rightsizing bot reads Datadog and turns usage into a size from the menu.\n\nQueries are Datadog metric queries with `$service` and `$env`, grouped by pod. Check the metric names against\nyour account: they differ between Datadog's Kubernetes integrations.",
+      "properties": {
+        "days": {
+          "default": 14,
+          "maximum": 60,
+          "minimum": 7,
+          "title": "Days",
+          "type": "integer"
+        },
+        "min_days": {
+          "default": 7,
+          "minimum": 1,
+          "title": "Min Days",
+          "type": "integer"
+        },
+        "cpu_percentile": {
+          "default": 0.95,
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Cpu Percentile",
+          "type": "number"
+        },
+        "cpu_margin": {
+          "default": 1.25,
+          "minimum": 1,
+          "title": "Cpu Margin",
+          "type": "number"
+        },
+        "memory_margin": {
+          "default": 1.3,
+          "minimum": 1,
+          "title": "Memory Margin",
+          "type": "number"
+        },
+        "cpu_query": {
+          "default": "max:kubernetes.cpu.usage.total{service:$service,env:$env} by {pod_name}",
+          "title": "Cpu Query",
+          "type": "string"
+        },
+        "memory_query": {
+          "default": "max:kubernetes.memory.working_set{service:$service,env:$env} by {pod_name}",
+          "title": "Memory Query",
+          "type": "string"
+        },
+        "oom_query": {
+          "default": "sum:kubernetes_state.container.status_report.count.terminated{service:$service,env:$env,reason:oomkilled}",
+          "title": "Oom Query",
+          "type": "string"
+        },
+        "price_per_vcpu_month": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "default": "25.00",
+          "title": "Price Per Vcpu Month"
+        },
+        "price_per_gib_month": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "default": "3.50",
+          "title": "Price Per Gib Month"
+        }
+      },
+      "title": "Rightsizing",
+      "type": "object"
+    },
     "Size": {
       "additionalProperties": false,
       "properties": {
@@ -294,6 +375,22 @@
       "minLength": 1,
       "title": "Release Bot",
       "type": "string"
+    },
+    "rightsizing_bot": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Rightsizing Bot"
+    },
+    "rightsizing": {
+      "$ref": "#/$defs/Rightsizing"
     },
     "kubectl_writers": {
       "default": [],

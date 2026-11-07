@@ -25,7 +25,7 @@ uv run berth check
 ```
 
 ```text
-ok: 6 apps, 17 app environments
+ok: 7 apps, 20 app environments
 ```
 
 Change a production setting for one app and ask for a much bigger pod for another, render, and ask who must approve:
@@ -55,7 +55,7 @@ Add `--approve bob.osei@contoso.com` and the payments-api line becomes `owner re
 
 ## How the pieces fit
 
-People edit `apps/<app>/app.yaml` and one file per environment, `apps/<app>/<env>.yaml`. `berth render` writes `rendered/`, and CI fails if the two disagree. After a merge, `pipelines/main.yml` runs `berth deploy` on the qa cluster, then prod, then Control-M. Airflow reads `rendered/airflow/<env>/` as a Git DAG bundle. On a pull request, `pipelines/pr.yml` runs the checks, and `pipelines/gate.yml` posts the `berth/review` status that the branch policy requires. `pipelines/drift.yml` posts the drift report to Slack every morning.
+People edit `apps/<app>/app.yaml` and one file per environment, `apps/<app>/<env>.yaml`. `berth render` writes `rendered/`, and CI fails if the two disagree. After a merge, `pipelines/main.yml` runs `berth deploy` on the qa cluster, then prod, then Control-M. Airflow reads `rendered/airflow/<env>/` as a Git DAG bundle. On a pull request, `pipelines/pr.yml` runs the checks, and `pipelines/gate.yml` posts the `berth/review` status that the branch policy requires. `pipelines/drift.yml` posts the drift report to Slack every morning. Two bots open pull requests through the same gate: `pipelines/rightsize.yml` proposes sizes from a fortnight of Datadog usage every Monday, and `pipelines/mirror.yml` copies new upstream image versions into ACR every day and opens their dev releases.
 
 | Path | Owned by | What it holds |
 |---|---|---|
@@ -63,9 +63,10 @@ People edit `apps/<app>/app.yaml` and one file per environment, `apps/<app>/<env
 | `platform/platform.yaml` | platform team | environments, clusters, vaults, the proxy, the Gateway, the size menu, approvers, break-glass groups, freezes |
 | `platform/review.yaml` | platform team | which changes need which review |
 | `platform/software/` | platform team | cluster software as pinned Helm charts: External Secrets Operator and Envoy Gateway |
+| `platform/mirrors.yaml` | platform team | upstream images copied into ACR for third-party apps, and kept current by the mirror bot |
 | `platform/schema/` | generated | JSON Schemas for editor completion (`berth schema`) |
 | `rendered/` | generated | what is deployed; never edited by hand |
-| `pipelines/` | platform team | Azure Pipelines for pull requests, the gate, deploys, the drift report, and app releases |
+| `pipelines/` | platform team | Azure Pipelines for pull requests, the gate, deploys, the drift report, app releases, and the rightsizing and mirror bots |
 | `src/berth/` | platform team | the renderer, review logic, deploy and drift tooling, and CLI |
 
 ## Documentation

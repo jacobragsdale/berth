@@ -90,7 +90,7 @@ def cluster(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Cluster]:
 
 
 def test_a_fresh_deploy_leaves_every_app_namespace_in_sync(cluster: Cluster) -> None:
-    assert "12 in sync, 0 need attention" in cluster.drift()
+    assert "14 in sync, 0 need attention" in cluster.drift()
     stamped = cluster.kubectl("get", "namespace", "ledger-dev", "-o", "jsonpath={.metadata.annotations.berth\\.contoso\\.io/deployed-commit}")
     assert len(stamped.stdout) == 40
 

@@ -240,7 +240,7 @@ A bad version stalls instead of breaking. Deployments roll with `maxUnavailable:
 | A shared Helm chart with a values file per app | The closest standard alternative. Helm templates are text templating, so they validate nothing until rendered. berth keeps the values-file idea and replaces the templates with typed code. |
 | Argo CD or Flux | See [Deploying](#deploying-kubectl-with-git-as-the-record). |
 | Kyverno | Its extras (mutating and generating objects) duplicate what the renderer already does, and as a webhook it would sit in the path of every deploy. |
-| Vertical Pod Autoscaler | The Datadog-driven rightsizing bot below needs nothing in the cluster and keeps git as the record of what each app requests. |
+| Vertical Pod Autoscaler | The rightsizing bot needs nothing in the cluster, and keeps git as the record of what each app requests. |
 | First-class dependency kinds (a `postgres:` block) | Third-party software is an ordinary app instead, so there is one kind of thing to learn and review. |
 
 ## Moving from the current repository
@@ -255,10 +255,17 @@ Today's starting point is kubectl from laptops, so the first goal is knowing wha
 
 Before requiring the gate, run it in report-only mode: post the status without making it required, and compare its decisions with the infra lead's for a few weeks.
 
+## Bots open pull requests; people decide
+
+Two bots keep the repository current without anyone remembering to. Each one opens pull requests through the same gate as everyone else, as an identity that may change one kind of field.
+
+- **Rightsizing.** Every Monday, the rightsizing bot reads each workload's CPU and memory from Datadog over two weeks, by the `service` and `env` tags berth puts on every pod. It turns them into a size from the menu: the 95th percentile of CPU and the peak of memory, each with a margin. That is the same idea as the Vertical Pod Autoscaler's recommender, but nothing runs in the cluster, and git stays the record of what each app requests. It never shrinks a workload that was killed for memory; it proposes one size up instead. It leaves CPU alone for services that autoscale on CPU. It opens one pull request per app and environment, with the evidence and an estimated saving. In dev and qa a size change merges once the checks pass; in prod an owner approves it. Node pools already autoscale, so smaller requests become fewer nodes. Google measured the same effect on its own fleet: jobs sized automatically left 23% slack, those sized by hand 46% ([Autopilot](https://research.google/pubs/autopilot-workload-autoscaling-at-google-scale/)).
+- **Mirror.** Every day, the mirror bot checks each image in `platform/mirrors.yaml` for a newer upstream tag on its track, such as the newest Redis 8.2.x. It copies the tag into ACR, and opens a dev release for every app still on an older one. It is the release bot's job for software you do not build. Moving to a new minor version is a reviewed change to the track.
+
+Both bots write a JSON plan first, and the pipeline opens the pull requests from it. The network calls (Datadog, the registries) and the repository edits never happen in the same step.
+
 ## Next to build
 
-- **A rightsizing bot.** It queries Datadog for each workload's CPU and memory over two to four weeks, by the `service` and `env` tags. It maps the result to the size menu with a safety margin, never shrinks memory after an OOM kill, and opens one pull request per app with the evidence. Its identity may change only sizes.
-- **A mirror bot.** For third-party apps, it imports new upstream tags into ACR and opens the dev version pull request, as the release bot does for internal apps.
 - **`berth adopt`,** which turns a live difference into the spec change that would make git match.
 - **More in the drift report:** prod secret writes by non-owners, owners who are no longer active accounts, and certificates that expire within 30 days.
 
@@ -271,6 +278,7 @@ Verified locally:
 - `berth deploy`, `drift`, `breakglass`, `--revert` and `--prune` against a real kube-apiserver and etcd (envtest 1.34);
 - every admission policy refusing what it should, and admitting every pod Airflow and Control-M start in dev and qa;
 - both platform software charts, rendered with their values and schema-checked;
+- the mirror bot's tag listing against Docker Hub, GitHub, Microsoft and Quay registries, including Docker Hub's token flow and pagination;
 - the generated DAGs in Airflow 3.2.2.
 
 Not run anywhere real, and marked so in each file that talks to it:
@@ -285,7 +293,10 @@ Not run anywhere real, and marked so in each file that talks to it:
   - the Gateway's internal load balancer annotations, through Gateway API's `infrastructure` field;
   - owners as `User` subjects in RoleBindings, which assumes AKS-managed Entra ID uses the user principal name;
   - about 1,100 namespaces per cluster.
-- **Datadog:** the OTLP endpoint (berth assumes the Datadog Agent's receiver on each node at port 4318), and the link URL formats.
+- **Datadog:**
+  - the OTLP endpoint (berth assumes the Datadog Agent's receiver on each node at port 4318), and the link URL formats;
+  - the rightsizing bot's queries: the v1 query API call, and the default metric names, which differ between Datadog's Kubernetes integrations.
+- **ACR:** `az acr import` in the mirror pipeline, and opening the bots' pull requests with `az repos pr create`.
 - **Control-M:**
   - the `Job:Kubernetes` field names and flow syntax, from BMC documentation that could only be read in search excerpts;
   - the `ctm` CLI commands;

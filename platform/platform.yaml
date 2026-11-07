@@ -8,6 +8,13 @@ repo_url: https://dev.azure.com/contoso/platform/_git/berth
 # Identity the release pipeline uses when it opens version-bump pull requests. It may change versions only.
 release_bot: berth-release@contoso.com
 
+# Identity the weekly rightsizing pipeline opens pull requests as. It may change sizes only. Its settings
+# (lookback, margins, Datadog queries) default as in docs/reference.md; prices only feed the savings estimate.
+rightsizing_bot: berth-rightsizing@contoso.com
+rightsizing:
+  price_per_vcpu_month: "25.00"
+  price_per_gib_month: "3.50"
+
 # Entra groups whose members may change app namespaces with kubectl in an emergency (`edit` there, nothing else).
 # The daily drift report shows anything changed this way that git does not have.
 kubectl_writers:

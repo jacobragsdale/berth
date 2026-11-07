@@ -129,6 +129,22 @@ def test_release_bot_may_change_versions_only() -> None:
 
 
 @pytest.mark.parametrize(
+    ("path", "tier", "approved", "state"),
+    [
+        ("services.api.size", Tier.AUTO, (), "succeeded"),  # dev and qa: merges once the checks pass
+        ("workflows.nightly.tasks.load.size", Tier.AUTO, (), "succeeded"),
+        ("services.api.size", Tier.OWNER, (), "pending"),  # prod: an owner approves
+        ("services.api.size", Tier.OWNER, (ANN,), "succeeded"),
+        ("services.api.replicas", Tier.AUTO, (), "failed"),  # sizes only
+        ("version", Tier.AUTO, (), "failed"),
+    ],
+)
+def test_the_rightsizing_bot_may_change_sizes_only(path: str, tier: Tier, approved: tuple[str, ...], state: str) -> None:
+    assert PLATFORM.rightsizing_bot is not None
+    assert _decide(_req(tier, path=path), _proposal(PLATFORM.rightsizing_bot, approved)).state == state
+
+
+@pytest.mark.parametrize(
     ("env", "now", "labels", "approved", "state"),
     [
         ("prod", IN_FREEZE, (), (BEN,), "pending"),

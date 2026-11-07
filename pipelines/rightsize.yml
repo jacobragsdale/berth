@@ -1,0 +1,57 @@
+# Every Monday: compare each workload's size with what it used in Datadog over the last two weeks, and open one
+# pull request per app per environment where a different size from the menu fits better. The pull request carries
+# the evidence. The bot may change sizes only (platform.yaml rightsizing_bot), so in dev and qa it merges once the
+# checks pass, and in prod an owner approves it.
+#
+# Not yet run in Azure DevOps. Needs a variable group berth-datadog (DD_API_KEY, DD_APP_KEY, DD_SITE; Key Vault-
+# linked), and a service connection berth-rightsizing for the bot's identity, which opens the pull requests.
+# The Datadog metric names in platform.yaml rightsizing are defaults: check them against your account first.
+trigger: none
+pr: none
+schedules:
+  - cron: "0 12 * * 1"
+    displayName: Weekly rightsizing
+    branches:
+      include: [main]
+    always: true
+
+pool:
+  vmImage: ubuntu-24.04
+
+variables:
+  - group: berth-datadog
+
+steps:
+  - checkout: self
+    persistCredentials: true
+  - template: templates/setup-uv.yml
+  - ${{ each env in split('dev,qa,prod', ',') }}:
+      - script: uv run berth rightsize --env ${{ env }} --plan-out "$(Agent.TempDirectory)/rightsize-${{ env }}.json"
+        displayName: Read Datadog for ${{ env }}
+        env:
+          DD_API_KEY: $(DD_API_KEY)
+          DD_APP_KEY: $(DD_APP_KEY)
+          DD_SITE: $(DD_SITE)
+  - task: AzureCLI@2
+    displayName: Open the pull requests
+    inputs:
+      azureSubscription: berth-rightsizing  # the rightsizing bot identity
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        for env in dev qa prod; do
+          plan="$(Agent.TempDirectory)/rightsize-$env.json"
+          for app in $(uv run python -c "import sys; from berth.rightsize import Plan; print(' '.join(Plan.model_validate_json(open(sys.argv[1]).read()).apps()))" "$plan"); do
+            branch="rightsize/$app-$env-$(date -u +%Y%m%d)"
+            git checkout -q -B "$branch" origin/main
+            uv run berth rightsize --apply "$plan" --app "$app" --markdown "$(Agent.TempDirectory)/pr.md"
+            uv run berth render
+            git add apps rendered
+            git -c user.name="berth rightsizing" -c user.email=berth-rightsizing@contoso.com commit -qm "rightsize $app in $env"
+            git push -q -f origin "$branch"
+            az repos pr create --repository berth --source-branch "$branch" --target-branch main \
+              --title "rightsize $app in $env" --description "$(cat "$(Agent.TempDirectory)/pr.md")" \
+              --auto-complete true --delete-source-branch true
+          done
+        done

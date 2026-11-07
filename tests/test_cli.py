@@ -53,7 +53,7 @@ def edit(path: Path, old: str, new: str) -> None:
 
 def test_check_passes_on_this_repository() -> None:
     code, out = berth("--root", str(REPO), "check")
-    assert (code, out.splitlines()[-1]) == (0, "ok: 6 apps, 17 app environments")
+    assert (code, out.splitlines()[-1]) == (0, "ok: 7 apps, 20 app environments")
 
 
 def test_hand_edited_rendered_output_fails_the_gate(repo: Path) -> None:

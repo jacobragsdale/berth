@@ -75,7 +75,7 @@ An app must have at least one service or workflow.
 | `version` | `tag@sha256:<64 hex>` | Required. The image to run. |
 | `config` | map | Merged over `app.yaml` `config`, key by key. |
 | `services.<name>` | `{size, replicas, autoscale}` | Replaces those fields for one service. Setting `replicas` clears `autoscale`, and the reverse. |
-| `workflows.<name>` | `{schedule, enabled}` | Replaces the schedule; `enabled: false` leaves the workflow out of this environment. |
+| `workflows.<name>` | `{schedule, enabled, tasks}` | Replaces the schedule; `enabled: false` leaves the workflow out of this environment; `tasks.<task>.size` replaces a task's size. |
 | `overrides` | list | Applied after the overrides in `app.yaml`. |
 
 ## platform.yaml
@@ -87,7 +87,9 @@ An app must have at least one service or workflow.
 | `registry` | Registry host for every image. |
 | `tenant_id` | Entra tenant of the Key Vaults. |
 | `repo_url` | This repository's URL, for links to commits. |
-| `release_bot` | Identity whose pull requests may change versions only. |
+| `release_bot` | Identity whose pull requests may change versions only. The mirror bot opens its pull requests as this identity too. |
+| `rightsizing_bot` | Identity whose pull requests may change sizes only (`services.*.size`, `workflows.*.tasks.*.size`). Optional. |
+| `rightsizing` | How the rightsizing bot reads usage; see [Rightsizing](#rightsizing). Every field has a default. |
 | `kubectl_writers` | Entra group object IDs whose members get `edit` in every app namespace, for break-glass. |
 | `platform_approvers` | Individuals, any one of whom satisfies a platform-tier review. |
 | `max_replicas_without_review` | `replicas` or `autoscale.max` above this needs platform review. |
@@ -99,6 +101,41 @@ An app must have at least one service or workflow.
 | `sizes.<name>` | `cpu`, `memory`, and `platform_review` (default `false`). The memory limit equals `memory`; there is no CPU limit. |
 | `identities` | `<app>/<env>` to workload identity client ID. |
 | `freezes` | `start`, `end` (time zone required) and `reason`. Production changes wait while a freeze is active. |
+
+## Rightsizing
+
+`platform.yaml`'s `rightsizing` block:
+
+| Field | Default | Description |
+|---|---|---|
+| `days` | `14` | How much history to read. 7–60. |
+| `min_days` | `7` | With less history than this, the bot leaves the size alone. |
+| `cpu_percentile` | `0.95` | The share of CPU samples the new size must cover (nearest rank). |
+| `cpu_margin` | `1.25` | Headroom over that percentile. |
+| `memory_margin` | `1.3` | Headroom over the peak working set. |
+| `cpu_query` | `max:kubernetes.cpu.usage.total{service:$service,env:$env} by {pod_name}` | Datadog query returning CPU in nanocores, per pod. |
+| `memory_query` | `max:kubernetes.memory.working_set{service:$service,env:$env} by {pod_name}` | Datadog query returning memory in bytes, per pod. |
+| `oom_query` | `sum:kubernetes_state.container.status_report.count.terminated{service:$service,env:$env,reason:oomkilled}` | Datadog query counting OOM kills. |
+| `price_per_vcpu_month`, `price_per_gib_month` | `25.00`, `3.50` | For the savings estimate only. |
+
+Queries must contain `$service` and `$env`; berth appends `.rollup(max, N)` (`sum` for OOM kills), with `N` chosen so a series stays under 1,400 points. The rules, in order:
+
+1. Less than `min_days` of data: no change.
+2. Any OOM kill: the next size up with more memory.
+3. Otherwise: the first size in menu order whose CPU is at least the percentile times the margin, and whose memory is at least the peak times the margin. A service that autoscales keeps its CPU request.
+
+## mirrors.yaml
+
+`platform/mirrors.yaml` lists upstream images to keep in the registry. Every app whose `image` is under `mirror/` needs an entry, and no two entries may fill one target.
+
+| Field | Description |
+|---|---|
+| `mirrors.<name>.source` | Upstream image, `host/repository`, for example `docker.io/library/redis`. |
+| `mirrors.<name>.target` | Repository in the registry, under `mirror/`. Apps refer to it as `image`. |
+| `mirrors.<name>.track` | `X` or `X.Y`: follow the newest `X.*.*` or `X.Y.*` tag. Tags must be `X.Y.Z` or `vX.Y.Z`. |
+| `mirrors.<name>.suffix` | Optional variant, such as `-alpine`, which tags must end with. |
+
+New tags are released to the environment nothing promotes from (`dev`), for apps whose version there is older.
 
 ## Platform software
 
@@ -145,6 +182,7 @@ Adjustments made after the table:
 - These raise a change to `platform`: a new `size` with `platform_review: true`; `replicas` or `autoscale.max` above `max_replicas_without_review`; a `version` not found in the history of the `promotes_from` environment's file on the target branch.
 - A new app also counts as starting in each of its environments (`environment` added), so its first prod deploy needs the platform team.
 - A change in an environment with `production: true` is at least `owner`.
+- The release bot may change only `version`, and the rightsizing bot only sizes; anything else from either fails the gate. Each satisfies an `auto` tier on its own.
 - An app's tier is the highest tier among its changes. Owners are read from the target branch, or from the change itself for a new app.
 
 ### Gate decision
@@ -257,6 +295,9 @@ berth [--root ROOT] COMMAND
 | `deploy` | `--cluster CLUSTER [--app APP [--env ENV]] [--changed-from REF] [--prune] [--revert] [--no-wait] [--include-break-glass] [--no-software] [--context CTX] [--kubeconfig PATH]` | Applies `rendered/k8s/CLUSTER/`; see [Deploying and drift](#deploying-and-drift). Refuses to run unless `berth check` passes. With `--app`, applies only that app (and not the platform); with `--changed-from`, only app namespaces whose manifests changed, plus the platform if `_platform/` or `platform/software/` changed. Exits 1 if any namespace failed. |
 | `drift` | `--cluster CLUSTER … [--slack] [--details PATH] [--context CTX] [--kubeconfig PATH]` | Reports each cluster's drift. `--slack` posts the summary to `SLACK_WEBHOOK_URL`; `--details` writes the full diffs. |
 | `breakglass` | `APP --env ENV (--reason TEXT [--hours N] \| --end) [--context CTX] [--kubeconfig PATH]` | Marks the app's namespace with who (from `kubectl auth whoami`), why and until when (default 8 hours), or removes the mark. |
+| `rightsize` | `--env ENV [--app APP] --plan-out PATH` | Reads Datadog (`DD_API_KEY`, `DD_APP_KEY`, `DD_SITE`) for every service and task in `ENV`, prints a recommendation for each, and writes the plan as JSON. Changes no files. |
+| `rightsize` | `--apply PLAN --app APP [--markdown PATH]` | Writes `APP`'s proposed sizes from a plan into its environment file, and the pull request description to `PATH`. |
+| `mirror` | `--plan-out PATH` | Lists each mirror's upstream tags, and writes the releases to make as JSON: the tag to copy and the apps to release it to. Changes no files. |
 
 kubectl's context defaults to the cluster's name. `BERTH_KUBECTL` and `BERTH_HELM` choose the binaries (default: from `PATH`).
 
