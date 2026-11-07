@@ -57,7 +57,7 @@ The [OpenGitOps v1.0 principles](https://opengitops.dev/) are declarative state,
 | Pattern | Source | In berth |
 |---|---|---|
 | Platform owns schema, generator and validators; owners write values | Meta, Google, Airbnb, Stripe | `model.py`, `render/`, `validate.py` |
-| Review the rendered output as well as the parameters | Meta, Akuity | `rendered/` committed and checked |
+| Review the rendered output as well as the parameters | Meta, Akuity | `berth diff` on every pull request; what deployed is published to the `rendered` branch |
 | Owners listed as individuals per directory | Google OWNERS | `owners:` in `app.yaml`, judged from the target branch |
 | Approval by rule and risk; humans only where needed | Google, Meta RADAR, Uber | `platform/review.yaml`, `review.py` |
 | Admission control as the real enforcement | Spotify, Airbnb | built-in ValidatingAdmissionPolicies, rendered by `render/admission.py` |

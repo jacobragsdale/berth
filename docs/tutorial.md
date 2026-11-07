@@ -88,12 +88,13 @@ git status --short
 You should see:
 
 ```text
-rendered 36 files (1 changed)
+rendered 36 files into rendered/ (36 changed)
 ?? apps/quote-board/
-?? rendered/k8s/aks-qa/quote-board-dev/
 ```
 
-berth wrote the app's Kubernetes manifests in `rendered/k8s/aks-qa/quote-board-dev/`. That file is exactly what `berth deploy` will apply to the qa cluster after the merge. Now check the whole repository again:
+berth wrote the app's Kubernetes manifests to `rendered/k8s/aks-qa/quote-board-dev/manifests.yaml`, beside everything else it renders. That file is exactly what `berth deploy` will apply to the qa cluster after the merge. Notice that git does not list it. The rendered tree is for you to read and is never committed: after the merge, the deploy pipeline renders `main` itself. Your pull request holds only the spec.
+
+Now check the whole repository again:
 
 ```sh
 uv run berth check
@@ -150,7 +151,7 @@ Kubernetes objects (rendered/k8s/aks-qa/quote-board-dev/manifests.yaml)
   Namespace quote-board-dev
   ServiceAccount quote-board
   RoleBinding berth-owners
-  RoleBinding berth-writers
+  RoleBinding berth-break-glass
   Deployment quote-board-api
   Service api
   NetworkPolicy berth-ingress
@@ -158,7 +159,7 @@ Kubernetes objects (rendered/k8s/aks-qa/quote-board-dev/manifests.yaml)
 
 The `Where to look` lines are for later, once the app is deployed; they need access to the cluster.
 
-Notice that you never wrote `replicas`: the platform's default for dev filled it in. Notice also the `berth-owners` RoleBinding. It gives you and Kai read access to your own namespace, pods and logs included, with your own kubectl login. Nobody had to set that up by hand. `berth-writers` lets the break-glass groups (`kubectl_writers` in `platform/platform.yaml`) fix things in an emergency. The NetworkPolicy, the security settings, the probes, the proxy settings and the Datadog tags are in the manifest file if you want to look.
+Notice that you never wrote `replicas`: the platform's default for dev filled it in. Notice also the `berth-owners` RoleBinding. It gives you and Kai read access to your own namespace, pods and logs included, with your own kubectl login. Nobody had to set that up by hand. `berth-break-glass` lets dev's break-glass group (`break_glass_groups` in `platform/platform.yaml`) fix things in an emergency, without being able to read Secrets. The NetworkPolicy, the security settings, the probes, the proxy settings and the Datadog tags are in the manifest file if you want to look.
 
 ## Ask who must approve
 
@@ -200,18 +201,16 @@ git add -A
 git commit -qm "Add quote-board"
 ```
 
-Now change a setting in dev only, render, and ask again. This time compare with your commit, `HEAD`, because that is where the app now exists:
+Now change a setting in dev only, and ask again. This time compare with your commit, `HEAD`, because that is where the app now exists:
 
 ```sh
 printf 'config:\n  REFRESH_SECONDS: "5"\n' >> apps/quote-board/dev.yaml
-uv run berth render
 uv run berth review --base HEAD --author nina.berg@contoso.com
 ```
 
 You should see:
 
 ```text
-rendered 36 files (1 changed)
 quote-board: auto review
   dev  config.REFRESH_SECONDS  - -> 5  auto  application settings
 gate: succeeded
@@ -220,21 +219,27 @@ gate: succeeded
 
 Nobody else has to approve. An owner changing a setting in dev is the owner's call, so the gate passes as soon as the checks do. Most changes to most apps look like this one.
 
+See what the change does to the manifests:
+
+```sh
+uv run berth diff --base HEAD
+```
+
+The diff adds a ConfigMap named `quote-board-config-` and a hash of its contents, and an `envFrom` that points the container at it. A different value gives a different name, so a settings change restarts the pods. The pull request build attaches the same diff to its run, for whoever reviews it.
+
 ## Make a risky change
 
 Undo that change, then ask for a much bigger pod:
 
 ```sh
-git restore apps rendered
+git restore apps
 sed -i 's/    size: s$/    size: xl/' apps/quote-board/app.yaml
-uv run berth render
 uv run berth review --base HEAD --author nina.berg@contoso.com
 ```
 
 On macOS, use `sed -i ''` instead of `sed -i`. You should see:
 
 ```text
-rendered 36 files (1 changed)
 quote-board: platform review
   dev  services.api.size  s -> xl  platform  size xl needs platform review
 gate: pending
@@ -248,16 +253,14 @@ It is the same field as `size: s` was, but the value decides the tier. A size th
 Undo the size change, and deploy the app to prod by giving it a prod version:
 
 ```sh
-git restore apps rendered
+git restore apps
 printf 'version: 0.1.0@sha256:bbfadb5f057fab4e27d7d70df4144472a347c3ff250fb24683abe858d6be820e\n' > apps/quote-board/prod.yaml
-uv run berth render
 uv run berth review --base HEAD --author nina.berg@contoso.com
 ```
 
 You should see:
 
 ```text
-rendered 37 files (1 changed)
 quote-board: platform review
   prod  environment  - -> added  platform  starting or stopping an app in an environment
 gate: pending
@@ -271,8 +274,9 @@ A first deploy to production needs the platform team. Most later prod changes, s
 Throw the tutorial away and return to `main`:
 
 ```sh
-git clean -fdq apps rendered
-git restore apps rendered
+git clean -fdq apps
+git restore apps
+rm -rf rendered
 git switch main
 git branch -D tutorial
 ```
