@@ -15,7 +15,7 @@ rules:
     tier: {dev: auto, qa: auto, prod: owner}
 
   - reason: application settings
-    paths: [config.*, files.*, secrets, talks_to]
+    paths: [config.*, files.*, secrets, talks_to, calls]
     tier: {dev: auto, qa: auto, prod: owner}
 
   - reason: how a service runs
@@ -27,16 +27,17 @@ rules:
       - services.*.size
       - services.*.replicas
       - services.*.autoscale.**
-      - services.*.expose   # internal is fine; public escalates in code
+      - services.*.writable
+      - services.*.expose
     tier: {dev: auto, qa: auto, prod: owner}
 
   - reason: what a workflow runs and when
     paths: [workflows.**]
     tier: {dev: auto, qa: auto, prod: owner}
 
-  - reason: a public hostname
+  - reason: a company hostname (callers use it; changing one in prod breaks them)
     paths: [services.*.hostname]
-    tier: platform
+    tier: {dev: auto, qa: auto, prod: owner}
 
   - reason: persistent storage
     paths: [services.*.volumes.**]
@@ -62,6 +63,7 @@ rules:
     paths: [environment]
     tier: {dev: auto, qa: owner, prod: platform}
 
+  # A new app is also judged by the environments it starts in (above), so its first prod deploy needs the platform team.
   - reason: a new or retired app
     paths: [app]
-    tier: platform
+    tier: owner

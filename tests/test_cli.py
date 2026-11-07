@@ -75,12 +75,12 @@ def test_a_production_setting_needs_the_other_owner(repo: Path) -> None:
 def test_a_pull_request_cannot_loosen_its_own_review(repo: Path) -> None:
     edit(
         repo / "platform/review.yaml",
-        "  - reason: a public hostname\n    paths: [services.*.hostname]\n    tier: platform",
-        "  - reason: a public hostname\n    paths: [services.*.hostname]\n    tier: auto",
+        "  - reason: access to Azure resources\n    paths: [azure_identity]\n    tier: platform",
+        "  - reason: access to Azure resources\n    paths: [azure_identity]\n    tier: auto",
     )
-    edit(repo / "apps/customer-portal/app.yaml", "hostname: portal", "hostname: portal-new")
-    out = review(repo, "--author", "erin.walsh@contoso.com")
-    assert "customer-portal: platform review" in out  # judged by the target branch's policy, not the edited one
+    edit(repo / "apps/ledger/app.yaml", "azure_identity: true", "azure_identity: false")
+    out = review(repo, "--author", "carol.diaz@contoso.com")
+    assert "ledger: platform review" in out  # judged by the target branch's policy, not the edited one
     assert "platform files: platform review" in out
 
 
@@ -128,6 +128,21 @@ def test_a_renderer_change_lists_affected_apps_without_asking_their_owners(repo:
 
 
 @pytest.mark.integration
-def test_rendered_output_passes_schemas_and_admission_policies() -> None:
-    done = subprocess.run([str(REPO / "scripts/validate-rendered.sh")], capture_output=True, text=True, check=False, timeout=600)
+@pytest.mark.parametrize("script", ["validate-rendered.sh", "validate-software.sh"])
+def test_rendered_output_passes_schemas_policies_and_permissions(script: str) -> None:
+    done = subprocess.run([str(REPO / "scripts" / script)], capture_output=True, text=True, check=False, timeout=600)
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_images_lists_only_digests_that_are_new_against_the_base(repo: Path) -> None:
+    digest = "sha256:" + "c" * 64
+    edit(repo / "apps/ledger/qa.yaml", "version: ", f"version: 9.9.9@{digest}\n# was: ")
+    code, out = berth("--root", str(repo), "images", "--base", "main")
+    assert (code, out) == (0, f"contosoacr.azurecr.io/ledger@{digest}\t9.9.9\n")
+
+
+def test_explain_shows_where_to_look_and_what_is_rendered(repo: Path) -> None:
+    code, out = berth("--root", str(repo), "explain", "ledger", "--env", "prod")
+    assert code == 0
+    assert "kubectl --context aks-prod -n ledger-prod get pods" in out
+    assert "  Deployment ledger-api" in out

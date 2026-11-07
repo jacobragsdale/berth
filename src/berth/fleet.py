@@ -7,10 +7,11 @@ from pathlib import PurePosixPath
 from pydantic import ValidationError
 
 from berth import yamlio
-from berth.model import App, EnvFile, Environment, Override, Platform, ReviewPolicy, Service, Spec, Workflow
+from berth.model import App, EnvFile, Environment, Override, Platform, ReviewPolicy, Service, Software, Spec, Workflow
 
 PLATFORM_FILE = "platform/platform.yaml"
 POLICY_FILE = "platform/review.yaml"
+SOFTWARE_DIR = "platform/software"
 APP_FILE = "app.yaml"
 
 type Tree = Mapping[str, str]
@@ -35,6 +36,7 @@ class Fleet:
     platform: Platform
     policy: ReviewPolicy
     apps: Mapping[str, AppSource]
+    software: Mapping[str, Software]
 
     def instances(self) -> Iterator["Instance"]:
         for name in sorted(self.apps):
@@ -116,9 +118,33 @@ def load(tree: Tree) -> Fleet:
         source = _load_app(name, by_app[name], tree, platform, problems)
         if source is not None:
             apps[name] = source
+    software = _load_software(tree, platform, problems)
     if problems:
         raise LoadError(problems)
-    return Fleet(platform=platform, policy=policy, apps=apps)
+    return Fleet(platform=platform, policy=policy, apps=apps, software=software)
+
+
+def _directly_in(path: str, directory: str) -> bool:
+    parent, _, name = path.rpartition("/")
+    return parent == directory and name.endswith(".yaml")
+
+
+def _load_software(tree: Tree, platform: Platform, problems: list[str]) -> dict[str, Software]:
+    found: dict[str, Software] = {}
+    releases: dict[tuple[str, str], str] = {}
+    for path in sorted(path for path in tree if _directly_in(path, SOFTWARE_DIR)):
+        software = _parsed(Software, tree, path, problems)
+        if software is None:
+            continue
+        found[PurePosixPath(path).stem] = software
+        for release, install in software.installs.items():
+            if install.cluster not in platform.clusters:
+                problems.append(f"{path}: installs.{release}: unknown cluster {install.cluster!r} ({', '.join(platform.clusters)})")
+            # Objects are labelled with their release, so a release name is unique per cluster.
+            other = releases.setdefault((install.cluster, release), path)
+            if other != path:
+                problems.append(f"{path}: installs.{release}: release name already used on {install.cluster} by {other}")
+    return found
 
 
 def _check_policy(policy: ReviewPolicy, platform: Platform, problems: list[str]) -> None:

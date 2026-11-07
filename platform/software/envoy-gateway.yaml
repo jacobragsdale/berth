@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=../schema/software.schema.json
+# Envoy Gateway implements the Gateway API. berth renders one Gateway per cluster, with a listener per environment,
+# and an HTTPRoute for each service exposed to the company. The certificates are wildcards per environment, kept as
+# PEM in the cluster's platform Key Vault.
+description: Gateway API controller for company callers
+repo: oci://docker.io/envoyproxy
+chart: gateway-helm
+version: v1.9.3
+order: 20
+installs:
+  envoy-gateway:
+    cluster: aks-qa
+    namespace: envoy-gateway-system
+    secrets:
+      berth-dev-tls:
+        type: kubernetes.io/tls
+        data: {tls.crt: wildcard-dev-apps-crt, tls.key: wildcard-dev-apps-key}
+      berth-qa-tls:
+        type: kubernetes.io/tls
+        data: {tls.crt: wildcard-qa-apps-crt, tls.key: wildcard-qa-apps-key}
+  envoy-gateway-prod:
+    cluster: aks-prod
+    namespace: envoy-gateway-system
+    secrets:
+      berth-prod-tls:
+        type: kubernetes.io/tls
+        data: {tls.crt: wildcard-apps-crt, tls.key: wildcard-apps-key}

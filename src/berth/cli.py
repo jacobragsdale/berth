@@ -1,6 +1,7 @@
-"""Check, render and review the deploy repo; release and promote versions."""
+"""Check, render and review the deploy repo; release and promote versions; deploy and check clusters."""
 
 import argparse
+import contextlib
 import json
 import sys
 from collections.abc import Sequence
@@ -9,14 +10,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO, assert_never
 
-from berth import diff, edit, gitio, report, validate
+from berth import cluster_cli, diff, edit, explain, gitio, notify, report, validate
 from berth.ado import Ado, AdoSettings, http_transport
 from berth.fleet import Fleet, LoadError, load
-from berth.model import App, EnvFile
+from berth.kube import KubeError
+from berth.model import App, EnvFile, Platform, Software
 from berth.render import ROOT, render, stale
 from berth.review import Decision, Proposal, Requirement, Votes, classify, decide, requirements
 
-SCHEMAS = {"platform/schema/app.schema.json": App, "platform/schema/env.schema.json": EnvFile}
+SCHEMAS = {"platform/schema/app.schema.json": App, "platform/schema/env.schema.json": EnvFile, "platform/schema/platform.schema.json": Platform, "platform/schema/software.schema.json": Software}
 
 
 @dataclass(frozen=True)
@@ -77,7 +79,20 @@ class Schema:
     check: bool
 
 
-type Command = Check | Render | Review | Gate | Release | Promote | New | Schema
+@dataclass(frozen=True)
+class Explain:
+    root: Path
+    app: str
+    env: str
+
+
+@dataclass(frozen=True)
+class Images:
+    root: Path
+    base: str | None
+
+
+type Command = Check | Render | Review | Gate | Release | Promote | New | Schema | Explain | Images | cluster_cli.Command
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -115,12 +130,21 @@ def _parser() -> argparse.ArgumentParser:
     new_cmd.add_argument("--env", default="dev")
     schema_cmd = sub.add_parser("schema", help="write the JSON Schemas editors use to complete and check spec files")
     schema_cmd.add_argument("--check", action="store_true")
+    explain_cmd = sub.add_parser("explain", help="show an app in one environment: merged settings and where each came from, rendered objects, links")
+    explain_cmd.add_argument("app")
+    explain_cmd.add_argument("--env", required=True)
+    images_cmd = sub.add_parser("images", help="list the image references (registry/repository@digest) the specs deploy")
+    images_cmd.add_argument("--base", help="only images that are new relative to this git ref")
+    cluster_cli.add_commands(sub)
     return parser
 
 
 def parse(argv: Sequence[str]) -> Command:  # noqa: PLR0911 - one return per command keeps the match exhaustive
-    ns = _parser().parse_args(argv)
+    parser = _parser()
+    ns = parser.parse_args(argv)
     root = Path(ns.root)
+    if ns.command in cluster_cli.COMMANDS:
+        return cluster_cli.parse(ns, root, parser.error)
     match ns.command:
         case "check":
             return Check(root)
@@ -138,6 +162,10 @@ def parse(argv: Sequence[str]) -> Command:  # noqa: PLR0911 - one return per com
             return New(root, edit.NewApp(ns.name, ns.description, tuple(ns.owner), ns.source, ns.version, ns.env))
         case "schema":
             return Schema(root, check=ns.check)
+        case "explain":
+            return Explain(root, ns.app, ns.env)
+        case "images":
+            return Images(root, ns.base)
         case other:
             msg = f"unknown command {other!r}"
             raise AssertionError(msg)
@@ -269,12 +297,43 @@ def _gate(cmd: Gate, out: TextIO, now: datetime) -> int:
     return 0
 
 
+def _images(fleet: Fleet) -> set[str]:
+    """Every image the fleet runs, as registry/repository@digest: the digest is what runs, so it is what to check."""
+    return {f"{fleet.platform.registry}/{fleet.apps[i.app].spec.repository}@{i.version.split('@', 1)[1]}\t{i.tag}" for i in fleet.instances()}
+
+
+def _list_images(cmd: Images, out: TextIO) -> int:
+    loaded = _load_worktree(cmd.root, out)
+    if loaded is None:
+        return 1
+    images = _images(loaded[0])
+    if cmd.base is not None:
+        # A base that does not load (before berth existed, say) leaves every image counted as new.
+        with contextlib.suppress(LoadError):
+            images -= _images(load(gitio.at_ref(cmd.root, cmd.base)))
+    out.writelines(f"{line}\n" for line in sorted(images))
+    return 0
+
+
 def _platform_of(root: Path, out: TextIO) -> Fleet | None:
     loaded = _load_worktree(root, out)
     return None if loaded is None else loaded[0]
 
 
-def run(cmd: Command, out: TextIO, now: datetime) -> int:  # noqa: PLR0911, PLR0912 - one branch per command, checked by assert_never
+def _checked(root: Path, out: TextIO) -> tuple[Fleet, dict[str, str]] | None:
+    """The worktree, only if `berth check` passes: nothing stale or invalid ever reaches a cluster."""
+    loaded = _load_worktree(root, out)
+    if loaded is None:
+        return None
+    problems = _problems(*loaded)
+    if problems:
+        out.writelines(f"{problem}\n" for problem in problems)
+        out.write("refusing to touch the cluster until `berth check` passes\n")
+        return None
+    return loaded
+
+
+def run(cmd: Command, out: TextIO, now: datetime) -> int:  # noqa: PLR0911, PLR0912, C901 - one branch per command, checked by assert_never
     try:
         match cmd:
             case Check():
@@ -300,6 +359,16 @@ def run(cmd: Command, out: TextIO, now: datetime) -> int:  # noqa: PLR0911, PLR0
                 paths = edit.new_app(cmd.root, cmd.app)
                 out.writelines(f"created {path.relative_to(cmd.root)}\n" for path in paths)
                 return 0
+            case Explain():
+                fleet = _platform_of(cmd.root, out)
+                if fleet is None:
+                    return 1
+                out.write(explain.text(fleet, cmd.app, cmd.env))
+                return 0 if fleet.instance(cmd.app, cmd.env) is not None else 1
+            case Images():
+                return _list_images(cmd, out)
+            case cluster_cli.Deploy() | cluster_cli.Drift() | cluster_cli.BreakGlassStart() | cluster_cli.BreakGlassEnd():
+                return cluster_cli.run(cmd, _platform_of, _checked, out, now)
             case Schema():
                 schemas = _schemas()
                 stale_paths = [path for path, text in schemas.items() if not (cmd.root / path).is_file() or (cmd.root / path).read_text() != text]
@@ -313,7 +382,7 @@ def run(cmd: Command, out: TextIO, now: datetime) -> int:  # noqa: PLR0911, PLR0
                 return 0
             case _:
                 assert_never(cmd)
-    except (edit.EditError, gitio.GitError) as error:
+    except (edit.EditError, gitio.GitError, KubeError, notify.NotifyError) as error:
         out.write(f"error: {error}\n")
         return 1
 

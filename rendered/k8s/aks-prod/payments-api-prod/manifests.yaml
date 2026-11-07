@@ -12,7 +12,7 @@ metadata:
   annotations:
     berth.contoso.io/app-owners: alice.ng@contoso.com, bob.osei@contoso.com
     berth.contoso.io/app-source: https://dev.azure.com/contoso/payments/_git/payments-api
-    kustomize.toolkit.fluxcd.io/prune: disabled
+    berth.contoso.io/keep: "true"
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -24,6 +24,47 @@ metadata:
     app.kubernetes.io/managed-by: berth
     berth.contoso.io/app: payments-api
     berth.contoso.io/env: prod
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: berth-owners
+  namespace: payments-api-prod
+  labels:
+    app.kubernetes.io/name: payments-api
+    app.kubernetes.io/managed-by: berth
+    berth.contoso.io/app: payments-api
+    berth.contoso.io/env: prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: alice.ng@contoso.com
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: bob.osei@contoso.com
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: berth-writers
+  namespace: payments-api-prod
+  labels:
+    app.kubernetes.io/name: payments-api
+    app.kubernetes.io/managed-by: berth
+    berth.contoso.io/app: payments-api
+    berth.contoso.io/env: prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edit
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: "77777777-7777-7777-7777-777777777777"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -76,6 +117,8 @@ metadata:
     berth.contoso.io/app: payments-api
     berth.contoso.io/env: prod
     app.kubernetes.io/component: api
+    tags.datadoghq.com/env: prod
+    tags.datadoghq.com/service: payments-api-api
 spec:
   revisionHistoryLimit: 3
   progressDeadlineSeconds: 600
@@ -96,7 +139,10 @@ spec:
         berth.contoso.io/app: payments-api
         berth.contoso.io/env: prod
         app.kubernetes.io/component: api
+        tags.datadoghq.com/env: prod
+        tags.datadoghq.com/service: payments-api-api
         app.kubernetes.io/version: "1.4.2"
+        tags.datadoghq.com/version: "1.4.2"
     spec:
       serviceAccountName: payments-api
       automountServiceAccountToken: false
@@ -123,6 +169,28 @@ spec:
               value: prod
             - name: BERTH_VERSION
               value: "1.4.2"
+            - name: OTEL_SERVICE_NAME
+              value: payments-api-api
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: deployment.environment.name=prod,service.version=1.4.2,service.namespace=payments-api
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://$(HOST_IP):4318
+            - name: HTTP_PROXY
+              value: http://proxy.contoso.com:8080
+            - name: HTTPS_PROXY
+              value: http://proxy.contoso.com:8080
+            - name: NO_PROXY
+              value: localhost,127.0.0.1,.svc,.cluster.local,10.244.0.0/16,10.0.0.0/16,.apps.contoso.com,.contoso.com
+            - name: http_proxy
+              value: http://proxy.contoso.com:8080
+            - name: https_proxy
+              value: http://proxy.contoso.com:8080
+            - name: no_proxy
+              value: localhost,127.0.0.1,.svc,.cluster.local,10.244.0.0/16,10.0.0.0/16,.apps.contoso.com,.contoso.com
             - name: DB_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -133,8 +201,12 @@ spec:
                 secretKeyRef:
                   name: payments-api-secrets
                   key: card-processor-key
+            - name: LEDGER_API_HOST
+              value: api.ledger-prod.svc.cluster.local
+            - name: LEDGER_API_PORT
+              value: "8080"
             - name: LEDGER_API_URL
-              value: http://api.ledger-prod.svc.cluster.local
+              value: http://api.ledger-prod.svc.cluster.local:8080
           envFrom:
             - configMapRef:
                 name: payments-api-config-344e0fee5d
@@ -156,18 +228,18 @@ spec:
             - name: tmp
               mountPath: /tmp
           ports:
-            - name: http
+            - name: app
               containerPort: 8080
           readinessProbe:
             httpGet:
               path: /healthz
-              port: http
+              port: app
             periodSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /healthz
-              port: http
+              port: app
             periodSeconds: 10
             failureThreshold: 6
             initialDelaySeconds: 10
@@ -200,9 +272,9 @@ spec:
     app.kubernetes.io/name: payments-api
     app.kubernetes.io/component: api
   ports:
-    - name: http
-      port: 80
-      targetPort: http
+    - name: app
+      port: 8080
+      targetPort: app
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler

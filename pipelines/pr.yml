@@ -4,7 +4,7 @@
 # is not the merge gate: a pull request could edit it. gate.yml is the gate. Editing anything under pipelines/
 # or src/ is a platform-tier change, so a weakened copy of this file still needs a platform approver.
 #
-# Not yet run in Azure DevOps.
+# Not yet run in Azure DevOps. The AzureCLI step needs a service connection named berth-acr-read with AcrPull.
 trigger: none
 pr: none  # Azure Repos ignores pr triggers; the branch policy queues this pipeline
 
@@ -27,7 +27,49 @@ steps:
     displayName: Specs valid; rendered/ and schemas up to date
 
   - script: scripts/validate-rendered.sh
-    displayName: Kubernetes schemas and admission policies on everything rendered
+    displayName: Kubernetes schemas on everything rendered, for this Kubernetes version and the next
+
+  - script: scripts/validate-software.sh "$(Agent.TempDirectory)/software-head"
+    displayName: Platform software charts render and pass schemas
+
+  - script: uv run pytest -m integration
+    displayName: Deploy, drift and admission policies against a real API server
+    env:
+      BERTH_KUBECTL: $(Build.SourcesDirectory)/.tools/bin/kubectl
+
+  - script: |
+      set -euo pipefail
+      git fetch --no-tags origin main
+      git worktree add -q "$(Agent.TempDirectory)/base" origin/main
+      if [ -d "$(Agent.TempDirectory)/base/platform/software" ]; then
+        (cd "$(Agent.TempDirectory)/base" && uv run --project "$(Build.SourcesDirectory)" python "$(Build.SourcesDirectory)/scripts/template_software.py" \
+          "$(Build.SourcesDirectory)/.tools/bin/helm" "$(Agent.TempDirectory)/software-base")
+      fi
+      diff -ru "$(Agent.TempDirectory)/software-base" "$(Agent.TempDirectory)/software-head" > "$(Agent.TempDirectory)/software.diff" || true
+      echo "$(grep -c '^[-+][^-+]' "$(Agent.TempDirectory)/software.diff" || true) changed lines in rendered platform software"
+      echo "##vso[task.uploadfile]$(Agent.TempDirectory)/software.diff"
+    displayName: What a chart or values change does to platform software (diff attached to the run)
+    env:
+      HELM_CACHE_HOME: $(Build.SourcesDirectory)/.tools/helm/cache
+      HELM_CONFIG_HOME: $(Build.SourcesDirectory)/.tools/helm/config
+      HELM_DATA_HOME: $(Build.SourcesDirectory)/.tools/helm/data
+
+  # Every digest a pull request introduces must exist in ACR and carry the tag written next to it, so the
+  # tag a person reads is the image that runs. Uses a read-only (AcrPull) service connection.
+  - task: AzureCLI@2
+    displayName: New image digests exist in ACR with the tag the spec names
+    inputs:
+      azureSubscription: berth-acr-read
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        uv run berth images --base origin/main | while IFS=$'\t' read -r image tag; do
+          registry=${image%%/*}; reference=${image#*/}
+          tags=$(az acr manifest show-metadata --registry "${registry%%.*}" --name "$reference" --query tags -o tsv)
+          if ! grep -qx "$tag" <<<"$tags"; then echo "##vso[task.logissue type=error]$image is not tagged $tag (tags: ${tags:-none})"; exit 1; fi
+          echo "ok $image $tag"
+        done
 
   - script: |
       set -euo pipefail

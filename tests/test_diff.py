@@ -30,8 +30,11 @@ def test_an_app_yaml_change_is_a_change_in_every_environment_it_reaches() -> Non
 def test_new_and_retired_environments_and_apps() -> None:
     before = tree({"demo": (app_spec(), {"dev": env_spec()})})
     after = tree({"demo": (app_spec(), {"dev": env_spec(), "prod": env_spec()}), "fresh": (app_spec(name="fresh"), {"dev": env_spec()})})
-    assert _changes(before, after) == [Change("demo", "prod", "environment", None, "added"), Change("fresh", None, "app", None, "added")]
-    assert _changes(after, before) == [Change("demo", "prod", "environment", "present", None), Change("fresh", None, "app", "present", None)]
+    # A new app also starts in each of its environments, so its first prod deploy is judged like any other.
+    added = [Change("demo", "prod", "environment", None, "added"), Change("fresh", None, "app", None, "added"), Change("fresh", "dev", "environment", None, "added")]
+    assert _changes(before, after) == added
+    retired = [Change("demo", "prod", "environment", "present", None), Change("fresh", None, "app", "present", None), Change("fresh", "dev", "environment", "present", None)]
+    assert _changes(after, before) == retired
 
 
 def test_a_platform_edit_is_not_attributed_to_the_apps_it_affects() -> None:

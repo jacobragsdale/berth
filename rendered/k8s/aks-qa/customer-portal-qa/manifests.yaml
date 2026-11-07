@@ -12,7 +12,7 @@ metadata:
   annotations:
     berth.contoso.io/app-owners: erin.walsh@contoso.com, farid.haddad@contoso.com
     berth.contoso.io/app-source: https://dev.azure.com/contoso/web/_git/customer-portal
-    kustomize.toolkit.fluxcd.io/prune: disabled
+    berth.contoso.io/keep: "true"
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -24,6 +24,47 @@ metadata:
     app.kubernetes.io/managed-by: berth
     berth.contoso.io/app: customer-portal
     berth.contoso.io/env: qa
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: berth-owners
+  namespace: customer-portal-qa
+  labels:
+    app.kubernetes.io/name: customer-portal
+    app.kubernetes.io/managed-by: berth
+    berth.contoso.io/app: customer-portal
+    berth.contoso.io/env: qa
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: erin.walsh@contoso.com
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: farid.haddad@contoso.com
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: berth-writers
+  namespace: customer-portal-qa
+  labels:
+    app.kubernetes.io/name: customer-portal
+    app.kubernetes.io/managed-by: berth
+    berth.contoso.io/app: customer-portal
+    berth.contoso.io/env: qa
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edit
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: "77777777-7777-7777-7777-777777777777"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -49,6 +90,8 @@ metadata:
     berth.contoso.io/app: customer-portal
     berth.contoso.io/env: qa
     app.kubernetes.io/component: web
+    tags.datadoghq.com/env: qa
+    tags.datadoghq.com/service: customer-portal-web
 spec:
   replicas: 1
   revisionHistoryLimit: 3
@@ -70,7 +113,10 @@ spec:
         berth.contoso.io/app: customer-portal
         berth.contoso.io/env: qa
         app.kubernetes.io/component: web
+        tags.datadoghq.com/env: qa
+        tags.datadoghq.com/service: customer-portal-web
         app.kubernetes.io/version: "2026.11.1"
+        tags.datadoghq.com/version: "2026.11.1"
     spec:
       serviceAccountName: customer-portal
       automountServiceAccountToken: false
@@ -90,8 +136,34 @@ spec:
               value: qa
             - name: BERTH_VERSION
               value: "2026.11.1"
+            - name: OTEL_SERVICE_NAME
+              value: customer-portal-web
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: deployment.environment.name=qa,service.version=2026.11.1,service.namespace=customer-portal
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://$(HOST_IP):4318
+            - name: HTTP_PROXY
+              value: http://proxy.contoso.com:8080
+            - name: HTTPS_PROXY
+              value: http://proxy.contoso.com:8080
+            - name: NO_PROXY
+              value: localhost,127.0.0.1,.svc,.cluster.local,10.244.0.0/16,10.0.0.0/16,.qa.apps.contoso.com,.contoso.com
+            - name: http_proxy
+              value: http://proxy.contoso.com:8080
+            - name: https_proxy
+              value: http://proxy.contoso.com:8080
+            - name: no_proxy
+              value: localhost,127.0.0.1,.svc,.cluster.local,10.244.0.0/16,10.0.0.0/16,.qa.apps.contoso.com,.contoso.com
+            - name: PAYMENTS_API_API_HOST
+              value: api.payments-api-qa.svc.cluster.local
+            - name: PAYMENTS_API_API_PORT
+              value: "8080"
             - name: PAYMENTS_API_API_URL
-              value: http://api.payments-api-qa.svc.cluster.local
+              value: http://api.payments-api-qa.svc.cluster.local:8080
           envFrom:
             - configMapRef:
                 name: customer-portal-config-bd135d0e31
@@ -113,18 +185,18 @@ spec:
             - name: tmp
               mountPath: /tmp
           ports:
-            - name: http
+            - name: app
               containerPort: 3000
           readinessProbe:
             httpGet:
               path: /api/health
-              port: http
+              port: app
             periodSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /api/health
-              port: http
+              port: app
             periodSeconds: 10
             failureThreshold: 6
             initialDelaySeconds: 10
@@ -149,12 +221,12 @@ spec:
     app.kubernetes.io/name: customer-portal
     app.kubernetes.io/component: web
   ports:
-    - name: http
-      port: 80
-      targetPort: http
+    - name: app
+      port: 3000
+      targetPort: app
 ---
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
 metadata:
   name: customer-portal-web
   namespace: customer-portal-qa
@@ -165,18 +237,18 @@ metadata:
     berth.contoso.io/env: qa
     app.kubernetes.io/component: web
 spec:
-  ingressClassName: webapprouting.kubernetes.azure.com
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      namespace: envoy-gateway-system
+      name: berth
+      sectionName: https-qa
+  hostnames:
+    - portal.qa.apps.contoso.com
   rules:
-    - host: portal.qa.contoso.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: web
-                port:
-                  name: http
+    - backendRefs:
+        - name: web
+          port: 3000
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -197,4 +269,4 @@ spec:
         - podSelector: {}
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: app-routing-system
+              kubernetes.io/metadata.name: envoy-gateway-system

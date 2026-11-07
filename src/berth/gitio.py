@@ -63,6 +63,10 @@ def at_ref(root: Path, ref: str) -> dict[str, str]:
     return tree
 
 
+def head_commit(root: Path) -> str:
+    return _git(root, "rev-parse", "HEAD").decode().strip()
+
+
 def changed_paths(base: Tree, head: Tree) -> list[str]:
     return sorted(path for path in set(base) | set(head) if base.get(path) != head.get(path))
 

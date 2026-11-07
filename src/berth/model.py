@@ -98,6 +98,10 @@ def _check_scaling(replicas: int | None, autoscale: Autoscale | None) -> None:
         raise ValueError(msg)
 
 
+# A directory a container may write to although the root filesystem is read-only, for images that expect one.
+WritablePath = Annotated[str, StringConstraints(pattern=r"^/[A-Za-z0-9_./-]+$")]
+
+
 class Service(Spec):
     command: Command | None = None
     args: Command | None = None
@@ -106,18 +110,20 @@ class Service(Spec):
     size: SizeName = "s"
     replicas: int | None = Field(default=None, ge=0)
     autoscale: Autoscale | None = None
-    expose: Literal["internal", "public"] = "internal"
+    # internal: other apps in the cluster only. company: also callers on the company network, by hostname.
+    expose: Literal["internal", "company"] = "internal"
     hostname: Annotated[str, StringConstraints(pattern=r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$")] | None = None  # one label; each environment adds its own domain
     volumes: dict[PartName, Volume] = Field(default_factory=dict)
+    writable: tuple[WritablePath, ...] = ()
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
         _check_scaling(self.replicas, self.autoscale)
-        if self.expose == "public" and (self.port is None or self.hostname is None):
-            msg = "a public service needs a port and a hostname"
+        if self.expose == "company" and (self.port is None or self.hostname is None):
+            msg = "a service exposed to the company needs a port and a hostname"
             raise ValueError(msg)
-        if self.expose != "public" and self.hostname is not None:
-            msg = "hostname is only allowed on a public service"
+        if self.expose != "company" and self.hostname is not None:
+            msg = "hostname is only allowed with expose: company"
             raise ValueError(msg)
         if self.health is not None and self.port is None:
             msg = "health checks need a port"
@@ -135,6 +141,7 @@ class Task(Spec):
     timeout: Duration = "1h"
     retries: int = Field(default=0, ge=0, le=5)
     depends_on: tuple[PartName, ...] = ()
+    writable: tuple[WritablePath, ...] = ()
 
 
 class Workflow(Spec):
@@ -201,6 +208,7 @@ class App(Spec):
     files: dict[FileName, str] = Field(default_factory=dict)
     secrets: tuple[SecretName, ...] = ()
     talks_to: tuple[ServiceRef, ...] = ()
+    calls: tuple[Annotated[str, StringConstraints(pattern=r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:\d{1,5})?$")], ...] = ()  # systems outside the cluster
     azure_identity: bool = False
     services: dict[PartName, Service] = Field(default_factory=dict)
     workflows: dict[PartName, Workflow] = Field(default_factory=dict)
@@ -208,7 +216,7 @@ class App(Spec):
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
-        for label, values in (("owners", self.owners), ("secrets", self.secrets), ("talks_to", self.talks_to)):
+        for label, values in (("owners", self.owners), ("secrets", self.secrets), ("talks_to", self.talks_to), ("calls", self.calls)):
             if len(set(values)) != len(values):
                 msg = f"{label} lists the same entry twice"
                 raise ValueError(msg)
@@ -269,17 +277,65 @@ class ControlMTarget(Spec):
     agent_service_account: str
 
 
+ClusterName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9-]{0,30}[a-z0-9]$")]
+HttpsUrl = Annotated[str, StringConstraints(pattern=r"^https://[^\s/]+(/\S*)?$")]
+DnsLabel = Annotated[str, StringConstraints(pattern=r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")]
+Domain = Annotated[str, StringConstraints(pattern=r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$")]
+
+
+class Proxy(Spec):
+    """The corporate proxy. Rendered into every container in upper and lower case, because tools differ."""
+
+    url: Annotated[str, StringConstraints(pattern=r"^https?://\S+$")]
+    # Never proxied, in addition to the cluster's own names and addresses, which berth always adds.
+    no_proxy: tuple[Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9.*/:-]+$")], ...] = ()
+
+
 class Environment(Spec):
-    cluster: str
+    cluster: ClusterName
     key_vault: str
     production: bool = False
     promotes_from: EnvName | None = None
     default_replicas: int = Field(ge=1)
-    ingress_class: str
-    ingress_namespace: str
-    public_domain: str
+    domain: Domain  # company hostnames are <hostname>.<domain>; a wildcard DNS record points it at the cluster's Gateway
+    proxy: Proxy | None = None
+    # Where pods send OpenTelemetry. `$(HOST_IP)` is the node's address, for an agent running as a DaemonSet.
+    otlp_endpoint: str | None = None
     airflow: AirflowTarget
     controlm: ControlMTarget
+
+
+IPv4 = Annotated[str, StringConstraints(pattern=r"^(\d{1,3}\.){3}\d{1,3}$")]
+Cidr = Annotated[str, StringConstraints(pattern=r"^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$")]
+EntraObjectId = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")]
+
+
+class Cluster(Spec):
+    key_vault: str  # platform secrets on this cluster, such as the Gateway's certificates
+    gateway_ip: IPv4  # the reserved private address of the cluster's Gateway, where the wildcard DNS records point
+    networks: tuple[Cidr, ...] = Field(min_length=1)  # pod and service ranges, never sent to the proxy
+
+
+class Gateway(Spec):
+    """The Gateway API implementation the platform installs. Each cluster gets one Gateway named `berth`."""
+
+    namespace: DnsLabel  # where the Gateway lives and its proxies run; app network policies admit traffic from it
+    controller: Annotated[str, StringConstraints(min_length=1)]
+
+
+LINK_FIELDS = frozenset({"app", "env", "namespace", "service", "cluster"})
+_LINK_FIELD = re.compile(r"\{([^{}]*)\}")
+
+
+def _check_link(value: str) -> str:
+    unknown = sorted(set(_LINK_FIELD.findall(value)) - LINK_FIELDS)
+    if unknown:
+        msg = f"unknown placeholder(s) {', '.join(unknown)}; use {', '.join(sorted(LINK_FIELDS))}"
+        raise ValueError(msg)
+    return value
+
+
+LinkTemplate = Annotated[HttpsUrl, AfterValidator(_check_link)]
 
 
 Tier = Literal["auto", "owner", "platform"]
@@ -303,22 +359,65 @@ class Freeze(Spec):
 class Platform(Spec):
     registry: str
     tenant_id: str
+    repo_url: HttpsUrl  # this repository, for links to commits
     platform_approvers: tuple[Identity, ...] = Field(min_length=1)
     release_bot: Annotated[str, StringConstraints(min_length=1)]
+    # Entra groups whose members may change app namespaces with kubectl, for break-glass. They get `edit` there.
+    kubectl_writers: tuple[EntraObjectId, ...] = ()
     max_replicas_without_review: int = Field(ge=1)
     storage_class: str
+    clusters: dict[ClusterName, Cluster] = Field(min_length=1)
+    gateway: Gateway
     environments: dict[EnvName, Environment] = Field(min_length=1)
     sizes: dict[SizeName, Size] = Field(min_length=1)
     identities: dict[Annotated[str, StringConstraints(pattern=r"^[a-z0-9-]+/[a-z0-9]+$")], str] = Field(default_factory=dict)
+    # Links shown by `berth explain` and in the drift report, e.g. to the service in Datadog.
+    links: dict[Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9-]{0,30}$")], LinkTemplate] = Field(default_factory=dict)
     freezes: tuple[Freeze, ...] = ()
 
     @model_validator(mode="after")
-    def _promotion_chain_known(self) -> Self:
+    def _references_known(self) -> Self:
         for name, env in self.environments.items():
             if env.promotes_from is not None and env.promotes_from not in self.environments:
                 msg = f"environment {name!r} promotes from unknown environment {env.promotes_from!r}"
                 raise ValueError(msg)
+            if env.cluster not in self.clusters:
+                msg = f"environment {name!r} is on unknown cluster {env.cluster!r}"
+                raise ValueError(msg)
         return self
+
+    def envs_on(self, cluster: str) -> list[str]:
+        return [name for name, env in self.environments.items() if env.cluster == cluster]
+
+
+class SoftwareSecret(Spec):
+    """A Kubernetes Secret platform software reads, filled from the cluster's platform Key Vault by External Secrets."""
+
+    type: Literal["Opaque", "kubernetes.io/tls"] = "Opaque"
+    data: dict[Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9._-]+$")], Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9-]{1,127}$")]] = Field(min_length=1)
+
+
+class SoftwareInstall(Spec):
+    cluster: ClusterName
+    namespace: DnsLabel
+    values: dict[str, object] = Field(default_factory=dict)  # merged over the shared values (RFC 7386)
+    secrets: dict[SecretName, SoftwareSecret] = Field(default_factory=dict)
+
+
+class Software(Spec):
+    """Cluster software (controllers, CRDs, webhooks) as a pinned Helm chart: `platform/software/<name>.yaml`.
+
+    Anything that only runs a container, such as Redis, is an ordinary app instead. Charts are rendered with
+    `helm template` at deploy time and applied by berth like everything else; Helm itself never installs anything.
+    """
+
+    description: Annotated[str, StringConstraints(min_length=1, max_length=200)]
+    repo: Annotated[str, StringConstraints(pattern=r"^(https|oci)://\S+$")]
+    chart: Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9-]*$")]
+    version: Annotated[str, StringConstraints(pattern=r"^v?\d+\.\d+\.\d+$")]  # exact: a range would change what runs without a commit
+    order: int = Field(default=0, ge=0, le=99)  # lower deploys first, e.g. CRDs other software needs
+    values: dict[str, object] = Field(default_factory=dict)
+    installs: dict[DnsLabel, SoftwareInstall] = Field(min_length=1)  # by Helm release name
 
 
 class Rule(Spec):

@@ -12,7 +12,7 @@ metadata:
   annotations:
     berth.contoso.io/app-owners: grace.kim@contoso.com, hiro.tanaka@contoso.com
     berth.contoso.io/app-source: https://dev.azure.com/contoso/risk/_git/risk-batch
-    kustomize.toolkit.fluxcd.io/prune: disabled
+    berth.contoso.io/keep: "true"
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -24,6 +24,47 @@ metadata:
     app.kubernetes.io/managed-by: berth
     berth.contoso.io/app: risk-batch
     berth.contoso.io/env: dev
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: berth-owners
+  namespace: risk-batch-dev
+  labels:
+    app.kubernetes.io/name: risk-batch
+    app.kubernetes.io/managed-by: berth
+    berth.contoso.io/app: risk-batch
+    berth.contoso.io/env: dev
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: grace.kim@contoso.com
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: hiro.tanaka@contoso.com
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: berth-writers
+  namespace: risk-batch-dev
+  labels:
+    app.kubernetes.io/name: risk-batch
+    app.kubernetes.io/managed-by: berth
+    berth.contoso.io/app: risk-batch
+    berth.contoso.io/env: dev
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edit
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: "77777777-7777-7777-7777-777777777777"
 ---
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
@@ -58,7 +99,9 @@ metadata:
     app.kubernetes.io/managed-by: berth
     berth.contoso.io/app: risk-batch
     berth.contoso.io/env: dev
-    app.kubernetes.io/component: cleanup
+    app.kubernetes.io/component: cleanup-purge
+    tags.datadoghq.com/env: dev
+    tags.datadoghq.com/service: risk-batch-cleanup-purge
 spec:
   schedule: 15 3 * * *
   timeZone: UTC
@@ -77,7 +120,10 @@ spec:
             berth.contoso.io/app: risk-batch
             berth.contoso.io/env: dev
             app.kubernetes.io/component: cleanup-purge
+            tags.datadoghq.com/env: dev
+            tags.datadoghq.com/service: risk-batch-cleanup-purge
             app.kubernetes.io/version: "0.9.0"
+            tags.datadoghq.com/version: "0.9.0"
         spec:
           serviceAccountName: risk-batch
           automountServiceAccountToken: false
@@ -103,6 +149,28 @@ spec:
                   value: dev
                 - name: BERTH_VERSION
                   value: "0.9.0"
+                - name: OTEL_SERVICE_NAME
+                  value: risk-batch-cleanup-purge
+                - name: OTEL_RESOURCE_ATTRIBUTES
+                  value: deployment.environment.name=dev,service.version=0.9.0,service.namespace=risk-batch
+                - name: HOST_IP
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.hostIP
+                - name: OTEL_EXPORTER_OTLP_ENDPOINT
+                  value: http://$(HOST_IP):4318
+                - name: HTTP_PROXY
+                  value: http://proxy.contoso.com:8080
+                - name: HTTPS_PROXY
+                  value: http://proxy.contoso.com:8080
+                - name: NO_PROXY
+                  value: localhost,127.0.0.1,.svc,.cluster.local,10.244.0.0/16,10.0.0.0/16,.dev.apps.contoso.com,.contoso.com
+                - name: http_proxy
+                  value: http://proxy.contoso.com:8080
+                - name: https_proxy
+                  value: http://proxy.contoso.com:8080
+                - name: no_proxy
+                  value: localhost,127.0.0.1,.svc,.cluster.local,10.244.0.0/16,10.0.0.0/16,.dev.apps.contoso.com,.contoso.com
                 - name: WAREHOUSE_PASSWORD
                   valueFrom:
                     secretKeyRef:

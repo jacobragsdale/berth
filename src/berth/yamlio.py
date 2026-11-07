@@ -8,7 +8,7 @@ from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString, LiteralScalarString
 
-# Flux and kubectl parse YAML with Go libraries that keep YAML 1.1 rules, where `on`, `no` and `1:30`
+# kubectl and other Go tools parse YAML with libraries that keep YAML 1.1 rules, where `on`, `no` and `1:30`
 # are not strings. ruamel writes YAML 1.2, so quote anything a 1.1 parser would read as another type.
 _YAML11_NON_STRING = re.compile(r"^(?i:y|n|yes|no|on|off|true|false|null|~|[-+]?(\.?[0-9][0-9_:.eE+-]*|\.inf|\.nan))$")
 

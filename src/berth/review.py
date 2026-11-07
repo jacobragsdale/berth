@@ -72,8 +72,6 @@ def classify(change: Change, platform: Platform, policy: ReviewPolicy, history: 
         escalations.append(f"size {after} needs platform review")
     if path.endswith((".replicas", ".autoscale.max")) and isinstance(after, int) and after > platform.max_replicas_without_review:
         escalations.append(f"more than {platform.max_replicas_without_review} replicas")
-    if path.endswith(".expose") and after == "public":
-        escalations.append("exposes a service outside the cluster")
     if path == "version" and change.app is not None and change.env is not None and isinstance(after, str):
         source = platform.environments[change.env].promotes_from
         if source is not None and after not in history.get((change.app, source), set()):

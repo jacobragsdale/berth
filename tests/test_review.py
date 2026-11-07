@@ -43,10 +43,11 @@ def test_path_patterns(pattern: str, path: str, expected: bool) -> None:  # noqa
         ("prod", "services.api.replicas", 3, 10, Tier.OWNER),
         ("prod", "services.api.replicas", 3, 11, Tier.PLATFORM),
         ("qa", "services.api.autoscale.max", 4, 11, Tier.PLATFORM),
-        ("dev", "services.api.expose", "internal", "public", Tier.PLATFORM),
-        ("dev", "services.api.expose", "public", "internal", Tier.AUTO),
+        ("dev", "services.api.expose", "internal", "company", Tier.AUTO),
+        ("prod", "services.api.expose", "internal", "company", Tier.OWNER),
         # Fields that are platform territory however small the change.
-        ("dev", "services.api.hostname", None, "portal", Tier.PLATFORM),
+        ("dev", "services.api.hostname", None, "portal", Tier.AUTO),
+        ("prod", "services.api.hostname", "portal", "portal-new", Tier.OWNER),
         ("dev", "services.api.volumes.data.size_gi", 10, 20, Tier.PLATFORM),
         ("dev", "azure_identity", False, True, Tier.PLATFORM),
         ("dev", "overrides", None, "[...]", Tier.PLATFORM),
@@ -56,7 +57,7 @@ def test_path_patterns(pattern: str, path: str, expected: bool) -> None:  # noqa
         ("dev", "something.new", None, 1, Tier.PLATFORM),
         ("staging", "config.X", None, "1", Tier.PLATFORM),
         (None, "owners", (ANN, BEN), (ANN, STRANGER), Tier.OWNER),
-        (None, "app", None, "added", Tier.PLATFORM),
+        (None, "app", None, "added", Tier.OWNER),
     ],
 )
 def test_classify_tiers(env: str | None, path: str, before: object, after: object, tier: Tier) -> None:

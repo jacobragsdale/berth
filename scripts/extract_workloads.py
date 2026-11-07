@@ -2,10 +2,9 @@
 
 Usage: python -I scripts/extract_workloads.py RENDERED_DIR OUT_DIR
 
-Those pods reach the cluster through a scheduler rather than Flux, so CI validates them separately with the
-same schemas and admission policies as everything else. Reads the files as data (ast.literal_eval and JSON);
-it never imports a DAG. Also writes OUT_DIR/values.yaml, the namespace labels the Kyverno CLI needs to
-evaluate namespaceSelector offline.
+Those pods reach the cluster through a scheduler rather than `berth deploy`, so CI validates them separately with
+the same schemas, and the integration tests submit them to a real API server to prove the admission policies accept
+them. Reads the files as data (ast.literal_eval and JSON); it never imports a DAG.
 """
 
 import ast
@@ -58,16 +57,7 @@ def main(rendered: Path, out: Path) -> int:
                 if job.get("Type") == "Job:Kubernetes":
                     _write(out, f"controlm-{definitions.parent.name}-{folder_name}-{job_name}", _yaml(job["Job Spec Yaml"]))
                     count += 1
-    namespaces: list[dict[str, object]] = []
-    for manifests in sorted(rendered.glob("k8s/*/*/manifests.yaml")):
-        for raw in YAML(typ="safe", pure=True).load_all(manifests.read_text()):
-            doc = _mapping(raw, str(manifests))
-            if doc.get("kind") == "Namespace":
-                metadata = _mapping(doc.get("metadata"), f"{manifests} metadata")
-                namespaces.append({"name": metadata["name"], "labels": metadata.get("labels", {})})
-    values = {"apiVersion": "cli.kyverno.io/v1alpha1", "kind": "Value", "namespaceSelector": namespaces}
-    (out / "values.yaml").write_text(json.dumps(values, indent=2) + "\n")
-    print(f"extracted {count} scheduler workloads and {len(namespaces)} namespaces to {out}")
+    print(f"extracted {count} scheduler workloads to {out}")
     return 0 if count else 1
 
 

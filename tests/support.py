@@ -49,3 +49,15 @@ def tree(apps: Mapping[str, tuple[Mapping[str, object], Mapping[str, Mapping[str
 
 def fleet(apps: Mapping[str, tuple[Mapping[str, object], Mapping[str, Mapping[str, object]]]] | None = None) -> Fleet:
     return load(tree(apps))
+
+
+def dig(value: object, *keys: str) -> object:
+    for key in keys:
+        assert isinstance(value, dict), f"expected a mapping at {key!r}"
+        value = {str(name): item for name, item in value.items()}[key]
+    return value
+
+
+def items(value: object) -> list[object]:
+    assert isinstance(value, list)
+    return list(value)

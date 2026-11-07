@@ -81,3 +81,114 @@ spec:
     - namespaceSelector:
         matchLabels:
           berth.contoso.io/env: prod
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: berth
+  labels:
+    app.kubernetes.io/managed-by: berth
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: berth
+  namespace: envoy-gateway-system
+  labels:
+    app.kubernetes.io/managed-by: berth
+spec:
+  gatewayClassName: berth
+  infrastructure:
+    annotations:
+      service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+      service.beta.kubernetes.io/azure-load-balancer-ipv4: "10.30.0.50"
+  listeners:
+    - name: https-prod
+      protocol: HTTPS
+      port: 443
+      hostname: '*.apps.contoso.com'
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: berth-prod-tls
+      allowedRoutes:
+        kinds:
+          - kind: HTTPRoute
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              app.kubernetes.io/managed-by: berth
+              berth.contoso.io/env: prod
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: https-redirect
+  namespace: envoy-gateway-system
+  labels:
+    app.kubernetes.io/managed-by: berth
+spec:
+  parentRefs:
+    - name: berth
+      sectionName: http
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301
+---
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: berth-platform
+  labels:
+    app.kubernetes.io/managed-by: berth
+spec:
+  provider:
+    azurekv:
+      authType: WorkloadIdentity
+      vaultUrl: https://kv-contoso-platform-prod.vault.azure.net
+      tenantId: "00000000-0000-0000-0000-000000000000"
+      serviceAccountRef:
+        name: external-secrets
+        namespace: external-secrets
+  conditions:
+    - namespaces:
+        - envoy-gateway-system
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: berth-prod-tls
+  namespace: envoy-gateway-system
+  labels:
+    app.kubernetes.io/managed-by: berth
+    app.kubernetes.io/instance: envoy-gateway-prod
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: berth-platform
+  target:
+    name: berth-prod-tls
+    creationPolicy: Owner
+    template:
+      type: kubernetes.io/tls
+  data:
+    - secretKey: tls.crt
+      remoteRef:
+        key: wildcard-apps-crt
+    - secretKey: tls.key
+      remoteRef:
+        key: wildcard-apps-key

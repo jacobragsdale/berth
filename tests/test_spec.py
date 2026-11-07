@@ -24,8 +24,8 @@ def test_the_default_spec_is_valid() -> None:
         ({"servics": {}}, "Extra inputs"),  # a typo is an error, not a silently ignored field
         ({"config": {"PORT": 8080}}, "valid string"),  # unquoted YAML numbers do not become strings by accident
         ({"config": {"log-level": "x"}}, "pattern"),
-        ({"services": {"web": {"port": 8080, "expose": "public"}}}, "needs a port and a hostname"),
-        ({"services": {"web": {"port": 8080, "hostname": "portal"}}}, "only allowed on a public service"),
+        ({"services": {"web": {"port": 8080, "expose": "company"}}}, "needs a port and a hostname"),
+        ({"services": {"web": {"port": 8080, "hostname": "portal"}}}, "only allowed with expose: company"),
         ({"services": {"web": {"port": 80}}}, "greater than or equal to 1024"),
         ({"services": {"w": {"replicas": 2, "volumes": {"d": {"path": "/d", "size_gi": 1}}}}}, "one replica"),
         ({"services": {"w": {"replicas": 2, "autoscale": {"min": 1, "max": 3}}}}, "not both"),

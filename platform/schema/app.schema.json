@@ -185,7 +185,7 @@
           "default": "internal",
           "enum": [
             "internal",
-            "public"
+            "company"
           ],
           "title": "Expose",
           "type": "string"
@@ -211,6 +211,15 @@
           },
           "title": "Volumes",
           "type": "object"
+        },
+        "writable": {
+          "default": [],
+          "items": {
+            "pattern": "^/[A-Za-z0-9_./-]+$",
+            "type": "string"
+          },
+          "title": "Writable",
+          "type": "array"
         }
       },
       "title": "Service",
@@ -276,6 +285,15 @@
             "type": "string"
           },
           "title": "Depends On",
+          "type": "array"
+        },
+        "writable": {
+          "default": [],
+          "items": {
+            "pattern": "^/[A-Za-z0-9_./-]+$",
+            "type": "string"
+          },
+          "title": "Writable",
           "type": "array"
         }
       },
@@ -426,6 +444,15 @@
         "type": "string"
       },
       "title": "Talks To",
+      "type": "array"
+    },
+    "calls": {
+      "default": [],
+      "items": {
+        "pattern": "^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:\\d{1,5})?$",
+        "type": "string"
+      },
+      "title": "Calls",
       "type": "array"
     },
     "azure_identity": {

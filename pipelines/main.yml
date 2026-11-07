@@ -1,26 +1,73 @@
-# After a merge to main. Flux applies rendered/k8s/ by itself and Airflow reads rendered/airflow/<env>/ as a
-# Git DAG bundle, so the only push left is Control-M, which has no pull-based sync.
+# After a merge to main: deploy to the qa cluster, then the prod cluster, then Control-M.
 #
-# Each environment is an Azure Pipelines environment (berth-controlm-<env>), which gives a deployment history
-# and a place for checks that do not live in YAML (business hours for prod, for example). Approval already
-# happened on the pull request, so there is no approval check here.
+# berth deploys with kubectl server-side apply. Each stage deploys what changed since the commit last deployed to
+# that cluster, which a git tag (deployed/<cluster>) records, so a failed run is picked up by the next one. An app
+# whose namespace is marked break-glass is skipped. A conflict with a change made by hand fails that app's deploy,
+# and the log says which field: adopt it in the spec or run the deploy pipeline with revert=true.
 #
-# Not yet run. The ctm commands follow BMC's Automation API docs, which could not be fetched directly when this
-# was written; confirm them against your Control-M version.
+# Each stage is an Azure Pipelines environment (berth-<cluster>), which gives a deployment history and a place for
+# checks that do not live in YAML, such as business hours for prod. Approval already happened on the pull request.
+#
+# Not yet run in Azure DevOps. Needs service connections berth-aks-qa and berth-aks-prod (workload identity
+# federation, with a Kubernetes role that can apply to berth's namespaces), and permission for the build service to
+# push tags. Control-M is run by another team: CTM_ENDPOINT and CTM_TOKEN are theirs, scoped to berth's folders.
 trigger:
   branches:
     include: [main]
-  paths:
-    include: [rendered/controlm]
 pr: none
+
+parameters:
+  - name: revert
+    displayName: Put git back over changes made by hand
+    type: boolean
+    default: false
 
 pool:
   vmImage: ubuntu-24.04
 
 stages:
+  - ${{ each cluster in split('aks-qa,aks-prod', ',') }}:
+      - stage: ${{ replace(cluster, '-', '_') }}
+        displayName: Deploy to ${{ cluster }}
+        jobs:
+          - deployment: deploy
+            environment: berth-${{ cluster }}
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: self
+                      fetchDepth: 0
+                      fetchTags: true
+                      persistCredentials: true  # to move the deployed/<cluster> tag
+                    - template: templates/setup-uv.yml
+                    - script: scripts/fetch-tools.sh
+                      displayName: Pinned kubectl and Helm
+                    - task: AzureCLI@2
+                      displayName: berth deploy
+                      inputs:
+                        azureSubscription: berth-${{ cluster }}
+                        scriptType: bash
+                        scriptLocation: inlineScript
+                        inlineScript: |
+                          set -euo pipefail
+                          az aks get-credentials --resource-group rg-${{ cluster }} --name ${{ cluster }} --context ${{ cluster }} --overwrite-existing
+                          kubelogin convert-kubeconfig -l azurecli
+                          since=$(git rev-parse -q --verify "refs/tags/deployed/${{ cluster }}" || true)
+                          args=(--cluster ${{ cluster }})
+                          if [ -n "$since" ]; then args+=(--changed-from "$since"); fi
+                          if [ "${{ parameters.revert }}" = "True" ]; then args+=(--revert); fi
+                          uv run berth deploy "${args[@]}"
+                          git tag -f "deployed/${{ cluster }}" HEAD
+                          git push -f origin "refs/tags/deployed/${{ cluster }}"
+                      env:
+                        BERTH_KUBECTL: $(Build.SourcesDirectory)/.tools/bin/kubectl
+                        BERTH_HELM: $(Build.SourcesDirectory)/.tools/bin/helm
+
   - ${{ each env in split('dev,qa,prod', ',') }}:
       - stage: controlm_${{ env }}
         displayName: Control-M ${{ env }}
+        dependsOn: [aks_prod]
         jobs:
           - deployment: deploy
             environment: berth-controlm-${{ env }}
@@ -41,5 +88,4 @@ stages:
                         ctm environment add berth "$(CTM_ENDPOINT)" "$(CTM_TOKEN)"
                         for f in "${files[@]}"; do ctm deploy "$f" -e berth; done
                       displayName: ctm deploy
-                      # TODO: delete folders that disappeared from rendered/ (ctm deploy only adds and updates),
-                      # and run a nightly drift check comparing deployed folders with rendered/.
+                      # ctm deploy only adds and updates: folders that disappear from rendered/ are left on the server.

@@ -54,7 +54,13 @@ def spec_changes(base: Fleet, head: Fleet, changed_files: Iterable[str]) -> list
     for app in touched:
         before, after = base.apps.get(app), head.apps.get(app)
         if before is None or after is None:
-            changes.append(Change(app, None, "app", None if before is None else PRESENT, None if after is None else ADDED))
+            old, new = (None, ADDED) if before is None else (PRESENT, None)
+            changes.append(Change(app, None, "app", old, new))
+            # A new or retired app also starts or stops in each of its environments, so a first deploy to
+            # production is judged as one, whether or not the app is new.
+            present = after if after is not None else before
+            if present is not None:
+                changes.extend(Change(app, env, "environment", old, new) for env in sorted(present.envs))
             continue
         for field in APP_LEVEL:
             old, new = getattr(before.spec, field), getattr(after.spec, field)

@@ -1,10 +1,17 @@
+# yaml-language-server: $schema=schema/platform.schema.json
 # Platform settings, owned by the platform team. Every change here needs platform review:
 # review.yaml has no rule for files outside apps/, and unmatched changes need the platform team.
 registry: contosoacr.azurecr.io
 tenant_id: 00000000-0000-0000-0000-000000000000
+repo_url: https://dev.azure.com/contoso/platform/_git/berth
 
 # Identity the release pipeline uses when it opens version-bump pull requests. It may change versions only.
 release_bot: berth-release@contoso.com
+
+# Entra groups whose members may change app namespaces with kubectl in an emergency (`edit` there, nothing else).
+# The daily drift report shows anything changed this way that git does not have.
+kubectl_writers:
+  - 77777777-7777-7777-7777-777777777777  # all developers
 
 # Individuals, not a team. Any one of them (other than the author) satisfies a platform-tier review.
 platform_approvers:
@@ -14,14 +21,38 @@ platform_approvers:
 max_replicas_without_review: 10
 storage_class: managed-csi
 
+# gateway_ip is the reserved private address of the cluster's Gateway; each environment's wildcard DNS record
+# (*.<domain>) points at it. networks are the pod and service ranges, never sent through the proxy.
+# key_vault holds platform secrets on the cluster, such as the Gateway's certificates.
+clusters:
+  aks-qa:
+    key_vault: kv-contoso-platform-qa
+    gateway_ip: 10.20.0.50
+    networks: [10.244.0.0/16, 10.0.0.0/16]
+  aks-prod:
+    key_vault: kv-contoso-platform-prod
+    gateway_ip: 10.30.0.50
+    networks: [10.244.0.0/16, 10.0.0.0/16]
+
+# Gateway API, implemented by Envoy Gateway (platform/software/envoy-gateway.yaml). Each cluster has one Gateway,
+# with a listener per environment that accepts routes only from that environment's namespaces.
+gateway:
+  namespace: envoy-gateway-system
+  controller: gateway.envoyproxy.io/gatewayclass-controller
+
+# Links shown by `berth explain` and in the drift report. Placeholders: {app} {env} {namespace} {service} {cluster}.
+links:
+  datadog-logs: https://app.datadoghq.com/logs?query=service%3A{service}%20env%3A{env}
+  datadog-traces: https://app.datadoghq.com/apm/traces?query=service%3A{service}%20env%3A{env}
+
 environments:
   dev:
     cluster: aks-qa
     key_vault: kv-contoso-dev
     default_replicas: 1
-    ingress_class: webapprouting.kubernetes.azure.com
-    ingress_namespace: app-routing-system
-    public_domain: dev.contoso.com
+    domain: dev.apps.contoso.com
+    proxy: {url: "http://proxy.contoso.com:8080", no_proxy: [.contoso.com]}
+    otlp_endpoint: http://$(HOST_IP):4318  # the Datadog Agent's OTLP receiver on each node
     airflow: {namespace: airflow-dev, service_account: airflow-worker}
     controlm: {server: ctm-nonprod, connection_profile: K8S_DEV, timezone: America/New_York, agent_namespace: controlm, agent_service_account: controlm-agent}
   qa:
@@ -29,9 +60,9 @@ environments:
     key_vault: kv-contoso-qa
     promotes_from: dev
     default_replicas: 1
-    ingress_class: webapprouting.kubernetes.azure.com
-    ingress_namespace: app-routing-system
-    public_domain: qa.contoso.com
+    domain: qa.apps.contoso.com
+    proxy: {url: "http://proxy.contoso.com:8080", no_proxy: [.contoso.com]}
+    otlp_endpoint: http://$(HOST_IP):4318
     airflow: {namespace: airflow-qa, service_account: airflow-worker}
     controlm: {server: ctm-nonprod, connection_profile: K8S_QA, timezone: America/New_York, agent_namespace: controlm, agent_service_account: controlm-agent}
   prod:
@@ -40,9 +71,9 @@ environments:
     production: true
     promotes_from: qa
     default_replicas: 2
-    ingress_class: webapprouting.kubernetes.azure.com
-    ingress_namespace: app-routing-system
-    public_domain: contoso.com
+    domain: apps.contoso.com
+    proxy: {url: "http://proxy.contoso.com:8080", no_proxy: [.contoso.com]}
+    otlp_endpoint: http://$(HOST_IP):4318
     airflow: {namespace: airflow, service_account: airflow-worker}
     controlm: {server: ctm-prod, connection_profile: K8S_PROD, timezone: America/New_York, agent_namespace: controlm, agent_service_account: controlm-agent}
 

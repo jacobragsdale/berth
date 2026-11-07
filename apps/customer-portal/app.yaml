@@ -11,7 +11,7 @@ services:
     port: 3000
     health: {path: /api/health}
     size: s
-    expose: public
+    expose: company
     hostname: portal
 
 config:

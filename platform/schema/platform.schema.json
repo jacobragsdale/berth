@@ -1,0 +1,392 @@
+{
+  "$defs": {
+    "AirflowTarget": {
+      "additionalProperties": false,
+      "properties": {
+        "namespace": {
+          "title": "Namespace",
+          "type": "string"
+        },
+        "service_account": {
+          "title": "Service Account",
+          "type": "string"
+        }
+      },
+      "required": [
+        "namespace",
+        "service_account"
+      ],
+      "title": "AirflowTarget",
+      "type": "object"
+    },
+    "Cluster": {
+      "additionalProperties": false,
+      "properties": {
+        "key_vault": {
+          "title": "Key Vault",
+          "type": "string"
+        },
+        "gateway_ip": {
+          "pattern": "^(\\d{1,3}\\.){3}\\d{1,3}$",
+          "title": "Gateway Ip",
+          "type": "string"
+        },
+        "networks": {
+          "items": {
+            "pattern": "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$",
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Networks",
+          "type": "array"
+        }
+      },
+      "required": [
+        "key_vault",
+        "gateway_ip",
+        "networks"
+      ],
+      "title": "Cluster",
+      "type": "object"
+    },
+    "ControlMTarget": {
+      "additionalProperties": false,
+      "properties": {
+        "server": {
+          "title": "Server",
+          "type": "string"
+        },
+        "connection_profile": {
+          "title": "Connection Profile",
+          "type": "string"
+        },
+        "timezone": {
+          "title": "Timezone",
+          "type": "string"
+        },
+        "agent_namespace": {
+          "title": "Agent Namespace",
+          "type": "string"
+        },
+        "agent_service_account": {
+          "title": "Agent Service Account",
+          "type": "string"
+        }
+      },
+      "required": [
+        "server",
+        "connection_profile",
+        "timezone",
+        "agent_namespace",
+        "agent_service_account"
+      ],
+      "title": "ControlMTarget",
+      "type": "object"
+    },
+    "Environment": {
+      "additionalProperties": false,
+      "properties": {
+        "cluster": {
+          "pattern": "^[a-z][a-z0-9-]{0,30}[a-z0-9]$",
+          "title": "Cluster",
+          "type": "string"
+        },
+        "key_vault": {
+          "title": "Key Vault",
+          "type": "string"
+        },
+        "production": {
+          "default": false,
+          "title": "Production",
+          "type": "boolean"
+        },
+        "promotes_from": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9]{0,9}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Promotes From"
+        },
+        "default_replicas": {
+          "minimum": 1,
+          "title": "Default Replicas",
+          "type": "integer"
+        },
+        "domain": {
+          "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$",
+          "title": "Domain",
+          "type": "string"
+        },
+        "proxy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Proxy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "otlp_endpoint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Otlp Endpoint"
+        },
+        "airflow": {
+          "$ref": "#/$defs/AirflowTarget"
+        },
+        "controlm": {
+          "$ref": "#/$defs/ControlMTarget"
+        }
+      },
+      "required": [
+        "cluster",
+        "key_vault",
+        "default_replicas",
+        "domain",
+        "airflow",
+        "controlm"
+      ],
+      "title": "Environment",
+      "type": "object"
+    },
+    "Freeze": {
+      "additionalProperties": false,
+      "description": "A window in which production changes wait. It delays merges rather than rejecting them; break-glass skips it.",
+      "properties": {
+        "start": {
+          "format": "date-time",
+          "title": "Start",
+          "type": "string"
+        },
+        "end": {
+          "format": "date-time",
+          "title": "End",
+          "type": "string"
+        },
+        "reason": {
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start",
+        "end",
+        "reason"
+      ],
+      "title": "Freeze",
+      "type": "object"
+    },
+    "Gateway": {
+      "additionalProperties": false,
+      "description": "The Gateway API implementation the platform installs. Each cluster gets one Gateway named `berth`.",
+      "properties": {
+        "namespace": {
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+          "title": "Namespace",
+          "type": "string"
+        },
+        "controller": {
+          "minLength": 1,
+          "title": "Controller",
+          "type": "string"
+        }
+      },
+      "required": [
+        "namespace",
+        "controller"
+      ],
+      "title": "Gateway",
+      "type": "object"
+    },
+    "Proxy": {
+      "additionalProperties": false,
+      "description": "The corporate proxy. Rendered into every container in upper and lower case, because tools differ.",
+      "properties": {
+        "url": {
+          "pattern": "^https?://\\S+$",
+          "title": "Url",
+          "type": "string"
+        },
+        "no_proxy": {
+          "default": [],
+          "items": {
+            "pattern": "^[A-Za-z0-9.*/:-]+$",
+            "type": "string"
+          },
+          "title": "No Proxy",
+          "type": "array"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "title": "Proxy",
+      "type": "object"
+    },
+    "Size": {
+      "additionalProperties": false,
+      "properties": {
+        "cpu": {
+          "pattern": "^\\d+m?$",
+          "title": "Cpu",
+          "type": "string"
+        },
+        "memory": {
+          "pattern": "^\\d+(Mi|Gi)$",
+          "title": "Memory",
+          "type": "string"
+        },
+        "platform_review": {
+          "default": false,
+          "title": "Platform Review",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "cpu",
+        "memory"
+      ],
+      "title": "Size",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "registry": {
+      "title": "Registry",
+      "type": "string"
+    },
+    "tenant_id": {
+      "title": "Tenant Id",
+      "type": "string"
+    },
+    "repo_url": {
+      "pattern": "^https://[^\\s/]+(/\\S*)?$",
+      "title": "Repo Url",
+      "type": "string"
+    },
+    "platform_approvers": {
+      "items": {
+        "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Platform Approvers",
+      "type": "array"
+    },
+    "release_bot": {
+      "minLength": 1,
+      "title": "Release Bot",
+      "type": "string"
+    },
+    "kubectl_writers": {
+      "default": [],
+      "items": {
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "type": "string"
+      },
+      "title": "Kubectl Writers",
+      "type": "array"
+    },
+    "max_replicas_without_review": {
+      "minimum": 1,
+      "title": "Max Replicas Without Review",
+      "type": "integer"
+    },
+    "storage_class": {
+      "title": "Storage Class",
+      "type": "string"
+    },
+    "clusters": {
+      "minProperties": 1,
+      "patternProperties": {
+        "^[a-z][a-z0-9-]{0,30}[a-z0-9]$": {
+          "$ref": "#/$defs/Cluster"
+        }
+      },
+      "title": "Clusters",
+      "type": "object"
+    },
+    "gateway": {
+      "$ref": "#/$defs/Gateway"
+    },
+    "environments": {
+      "minProperties": 1,
+      "patternProperties": {
+        "^[a-z][a-z0-9]{0,9}$": {
+          "$ref": "#/$defs/Environment"
+        }
+      },
+      "title": "Environments",
+      "type": "object"
+    },
+    "sizes": {
+      "minProperties": 1,
+      "patternProperties": {
+        "^[a-z0-9]{1,8}$": {
+          "$ref": "#/$defs/Size"
+        }
+      },
+      "title": "Sizes",
+      "type": "object"
+    },
+    "identities": {
+      "patternProperties": {
+        "^[a-z0-9-]+/[a-z0-9]+$": {
+          "type": "string"
+        }
+      },
+      "title": "Identities",
+      "type": "object"
+    },
+    "links": {
+      "patternProperties": {
+        "^[a-z][a-z0-9-]{0,30}$": {
+          "pattern": "^https://[^\\s/]+(/\\S*)?$",
+          "type": "string"
+        }
+      },
+      "title": "Links",
+      "type": "object"
+    },
+    "freezes": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Freeze"
+      },
+      "title": "Freezes",
+      "type": "array"
+    }
+  },
+  "required": [
+    "registry",
+    "tenant_id",
+    "repo_url",
+    "platform_approvers",
+    "release_bot",
+    "max_replicas_without_review",
+    "storage_class",
+    "clusters",
+    "gateway",
+    "environments",
+    "sizes"
+  ],
+  "title": "Platform",
+  "type": "object"
+}

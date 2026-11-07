@@ -3,7 +3,7 @@ from collections.abc import Iterator
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
-from support import REPO, app_spec, env_spec, fleet
+from support import REPO, app_spec, dig, env_spec, fleet, items
 
 from berth import gitio, yamlio
 from berth.fleet import load
@@ -20,28 +20,17 @@ def _all_docs(files: dict[str, str]) -> Iterator[object]:
             yield from yamlio.load_all(text, source=path)
 
 
-def dig(value: object, *keys: str) -> object:
-    for key in keys:
-        assert isinstance(value, dict), f"expected a mapping at {key!r}"
-        value = {str(name): item for name, item in value.items()}[key]
-    return value
-
-
-def items(value: object) -> list[object]:
-    assert isinstance(value, list)
-    return list(value)
-
-
 def test_rendering_is_deterministic() -> None:
     assert render(REAL) == render(REAL)
 
 
-def test_each_app_environment_gets_one_manifest_file_and_one_flux_kustomization() -> None:
+def test_each_app_environment_gets_one_manifest_file_and_each_cluster_its_platform_files() -> None:
     files = render(REAL)
     for instance in REAL.instances():
         cluster = REAL.platform.environments[instance.env].cluster
         assert f"rendered/k8s/{cluster}/{instance.namespace}/manifests.yaml" in files
-        assert f"rendered/k8s/{cluster}/_flux/{instance.namespace}.yaml" in files
+    for cluster in REAL.platform.clusters:
+        assert {f"rendered/k8s/{cluster}/_platform/{name}.yaml" for name in ("namespaces", "platform", "admission")} <= set(files)
 
 
 def _pod_specs(doc: object) -> Iterator[object]:
@@ -66,7 +55,7 @@ def test_every_rendered_pod_runs_locked_down() -> None:
 def test_data_bearing_objects_are_never_pruned_by_absence() -> None:
     kept = [doc for doc in _all_docs(render(REAL)) if dig(doc, "kind") in {"Namespace", "PersistentVolumeClaim"}]
     assert {dig(doc, "kind") for doc in kept} == {"Namespace", "PersistentVolumeClaim"}
-    assert all(dig(doc, "metadata", "annotations", "kustomize.toolkit.fluxcd.io/prune") == "disabled" for doc in kept)
+    assert all(dig(doc, "metadata", "annotations", "berth.contoso.io/keep") == "true" for doc in kept)
 
 
 def test_a_config_change_renames_the_config_map_so_pods_restart() -> None:
@@ -130,3 +119,76 @@ def test_config_values_round_trip_as_strings(config: dict[str, str]) -> None:
 def test_control_characters_are_escaped_not_put_in_a_block(value: str) -> None:
     # Found by test_config_values_round_trip_as_strings: a literal block cannot hold control characters.
     assert yamlio.load(yamlio.dump({"k": value}), source="test") == {"k": value}
+
+
+def _docs_for(files: dict[str, str], path: str) -> list[object]:
+    return list(yamlio.load_all(files[path], source=path))
+
+
+def _container(files: dict[str, str], path: str, kind: str = "Deployment") -> dict[str, object]:
+    (workload,) = [doc for doc in _docs_for(files, path) if dig(doc, "kind") == kind]
+    (main,) = items(dig(workload, "spec", "template", "spec", "containers"))
+    assert isinstance(main, dict)
+    return {str(k): v for k, v in main.items()}
+
+
+def _env(container: dict[str, object]) -> dict[str, str]:
+    return {str(dig(var, "name")): str(dig(var, "value")) for var in items(container["env"]) if isinstance(var, dict) and "value" in var}
+
+
+def test_every_container_gets_the_proxy_with_the_cluster_never_proxied() -> None:
+    env = _env(_container(render(fleet()), "rendered/k8s/aks-qa/demo-dev/manifests.yaml"))
+    assert env["HTTPS_PROXY"] == env["https_proxy"] == "http://proxy.contoso.com:8080"
+    bypass = env["NO_PROXY"].split(",")
+    assert {".svc", ".cluster.local", "10.244.0.0/16", ".dev.apps.contoso.com", ".contoso.com"} <= set(bypass)
+    assert env["no_proxy"] == env["NO_PROXY"]
+
+
+def test_talks_to_gives_the_callers_host_port_and_url_on_the_targets_real_port() -> None:
+    redis = app_spec(name="cache", services={"redis": {"port": 6379, "size": "s"}})
+    caller = app_spec(talks_to=["cache/redis"])
+    files = render(fleet({"cache": (redis, {"dev": env_spec()}), "demo": (caller, {"dev": env_spec()})}))
+    env = _env(_container(files, "rendered/k8s/aks-qa/demo-dev/manifests.yaml"))
+    assert env["CACHE_REDIS_HOST"] == "redis.cache-dev.svc.cluster.local"
+    assert env["CACHE_REDIS_PORT"] == "6379"
+    assert env["CACHE_REDIS_URL"] == "http://redis.cache-dev.svc.cluster.local:6379"
+    (service,) = [doc for doc in _docs_for(files, "rendered/k8s/aks-qa/cache-dev/manifests.yaml") if dig(doc, "kind") == "Service"]
+    assert dig(items(dig(service, "spec", "ports"))[0], "port") == 6379
+
+
+def test_a_company_service_gets_a_route_on_its_environments_listener() -> None:
+    spec = app_spec(services={"api": {"port": 8080, "expose": "company", "hostname": "quotes"}})
+    files = render(fleet({"demo": (spec, {"qa": env_spec()})}))
+    (route,) = [doc for doc in _docs_for(files, "rendered/k8s/aks-qa/demo-qa/manifests.yaml") if dig(doc, "kind") == "HTTPRoute"]
+    assert dig(route, "spec", "hostnames") == ["quotes.qa.apps.contoso.com"]
+    assert dig(items(dig(route, "spec", "parentRefs"))[0], "sectionName") == "https-qa"
+    (gateway,) = [doc for doc in _docs_for(files, "rendered/k8s/aks-qa/_platform/platform.yaml") if dig(doc, "kind") == "Gateway"]
+    listeners = {str(dig(item, "name")): item for item in items(dig(gateway, "spec", "listeners"))}
+    assert set(listeners) == {"https-dev", "https-qa", "http"}
+    assert dig(listeners["https-qa"], "hostname") == "*.qa.apps.contoso.com"
+    assert dig(listeners["https-qa"], "allowedRoutes", "namespaces", "selector", "matchLabels", "berth.contoso.io/env") == "qa"
+
+
+def test_writable_paths_get_an_empty_directory_each() -> None:
+    spec = app_spec(services={"api": {"port": 8080, "writable": ["/var/run/redis", "/data"]}})
+    files = render(fleet({"demo": (spec, {"dev": env_spec()})}))
+    main = _container(files, "rendered/k8s/aks-qa/demo-dev/manifests.yaml")
+    mounts = {str(dig(m, "mountPath")): str(dig(m, "name")) for m in items(main["volumeMounts"])}
+    assert mounts["/var/run/redis"] == "writable-0"
+    assert mounts["/data"] == "writable-1"
+
+
+def test_owners_read_and_the_writer_groups_edit_every_app_namespace() -> None:
+    docs = _docs_for(render(fleet()), "rendered/k8s/aks-qa/demo-dev/manifests.yaml")
+    bindings = {str(dig(doc, "metadata", "name")): doc for doc in docs if dig(doc, "kind") == "RoleBinding"}
+    assert dig(bindings["berth-owners"], "roleRef", "name") == "view"
+    assert dig(bindings["berth-writers"], "roleRef", "name") == "edit"
+    assert {str(dig(s, "kind")) for s in items(dig(bindings["berth-writers"], "subjects"))} == {"Group"}
+
+
+def test_platform_software_namespaces_are_not_app_namespaces() -> None:
+    files = render(REAL)
+    for doc in _docs_for(files, "rendered/k8s/aks-qa/_platform/namespaces.yaml"):
+        labels = dig(doc, "metadata", "labels")
+        assert isinstance(labels, dict)
+        assert "app.kubernetes.io/managed-by" not in labels  # so the app admission policies leave their pods alone
