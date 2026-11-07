@@ -53,6 +53,14 @@ class Fleet:
             return None
         return resolve(source.spec, env, self.platform.environments[env], source.envs[env])
 
+    def callers(self) -> dict[tuple[str, str], set[str]]:
+        """The apps that call each app, by (app, environment): `talks_to` read from the side of the app being called."""
+        found: dict[tuple[str, str], set[str]] = {}
+        for instance in self.instances():
+            for ref in instance.talks_to:
+                found.setdefault((ref.split("/", 1)[0], instance.env), set()).add(instance.app)
+        return found
+
 
 class Instance(Spec):
     """One app in one environment, after the environment file is merged over app.yaml. Review diffs compare these."""

@@ -273,7 +273,7 @@ def _reviewed(root: Path, base_ref: str, out: TextIO) -> _Reviewed | None:
     sources = {
         (change.app, source)
         for change in changes
-        if change.path == "version" and change.app is not None and change.env is not None and change.env in platform.environments
+        if change.path == ("version",) and change.app is not None and change.env is not None and change.env in platform.environments
         if (source := platform.environments[change.env].promotes_from) is not None
     }
     history = gitio.version_history(root, base_ref, sources)

@@ -5,7 +5,8 @@
 #   owner     another owner of the app approves
 #   platform  an owner and a platform approver both approve
 #
-# `*` matches one path segment and `**` any number. A path no rule matches needs platform review, and so
+# `*` matches one key and `**` any number; a key with a dot in it, such as the file name in files.indexer.toml, is
+# still one key. A path no rule matches needs platform review, and so
 # does anything outside apps/. Production never drops below owner. Code adds three escalations on top of
 # this table (see src/berth/review.py): sizes marked platform_review, replicas above
 # max_replicas_without_review, and a version that has not run in the environment it promotes from.
@@ -16,6 +17,12 @@ rules:
 
   - reason: application settings
     paths: [config.*, files.*, secrets, talks_to, calls]
+    tier: {dev: auto, qa: auto, prod: owner}
+
+  # When one app adds another to its talks_to, the called app's network policy starts admitting it. berth records that
+  # as a change to the called app (callers.<caller>), so the called app's owners decide who may reach it.
+  - reason: a new caller (this app's network policy will admit it)
+    paths: [callers.*]
     tier: {dev: auto, qa: auto, prod: owner}
 
   - reason: how a service runs

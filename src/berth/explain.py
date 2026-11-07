@@ -3,7 +3,7 @@ for it, and where to look at it running. Meant for someone who has just been han
 
 from dataclasses import dataclass
 
-from berth.diff import flatten
+from berth.diff import FieldPath, flatten, show
 from berth.fleet import Fleet, Instance
 from berth.render import ROOT, instance_docs
 from berth.render.airflow import dag_id
@@ -21,8 +21,8 @@ class Setting:
     source: str  # the file that set it, or "default"
 
 
-def _show(path: str, value: object) -> str:
-    if path.startswith("files."):
+def _show(path: FieldPath, value: object) -> str:
+    if path[0] == "files":
         return f"({len(str(value).splitlines())} lines)"
     text = ", ".join(str(item) for item in value) if isinstance(value, tuple) else str(value)
     if not text:
@@ -45,11 +45,11 @@ def settings(fleet: Fleet, instance: Instance) -> list[Setting]:
             origin = env_file
         elif path in written_app:
             origin = app_file
-        elif path.endswith(".replicas"):
+        elif path[-1] == "replicas":
             origin = f"platform default for {instance.env}"
         else:
             origin = DEFAULT
-        found.append(Setting(path, _show(path, resolved[path]), origin))
+        found.append(Setting(show(path), _show(path, resolved[path]), origin))
     found.extend(Setting(f"workflows.{name}", "disabled", env_file) for name, patch in sorted(source.envs[instance.env].workflows.items()) if not patch.enabled)
     return found
 

@@ -27,7 +27,16 @@ STRANGER = "zoe@contoso.com"
     ],
 )
 def test_path_patterns(pattern: str, path: str, expected: bool) -> None:  # noqa: FBT001 - parametrized expectation
-    assert matches(pattern, path) is expected
+    assert matches(pattern, _path(path)) is expected
+
+
+def _path(dotted: str) -> tuple[str, ...]:
+    return tuple(dotted.split("."))
+
+
+def test_a_file_name_with_a_dot_is_one_key() -> None:
+    assert matches("files.*", ("files", "indexer.toml"))
+    assert classify(Change("demo", "dev", ("files", "indexer.toml"), "a", "b"), PLATFORM, POLICY, {}).tier is Tier.AUTO
 
 
 @pytest.mark.parametrize(
@@ -61,11 +70,11 @@ def test_path_patterns(pattern: str, path: str, expected: bool) -> None:  # noqa
     ],
 )
 def test_classify_tiers(env: str | None, path: str, before: object, after: object, tier: Tier) -> None:
-    assert classify(Change("demo", env, path, before, after), PLATFORM, POLICY, {}).tier is tier
+    assert classify(Change("demo", env, _path(path), before, after), PLATFORM, POLICY, {}).tier is tier
 
 
 def test_files_outside_apps_need_platform_review() -> None:
-    assert classify(Change(None, None, "platform_file.platform/platform.yaml", None, "x"), PLATFORM, POLICY, {}).tier is Tier.PLATFORM
+    assert classify(Change(None, None, ("platform_file", "platform/platform.yaml"), None, "x"), PLATFORM, POLICY, {}).tier is Tier.PLATFORM
 
 
 @pytest.mark.parametrize(
@@ -79,12 +88,12 @@ def test_files_outside_apps_need_platform_review() -> None:
     ],
 )
 def test_version_must_have_run_in_the_previous_environment(env: str, history: dict[tuple[str, str], set[str]], tier: Tier) -> None:
-    change = Change("demo", env, "version", version("1.3.0"), version("1.4.0"))
+    change = Change("demo", env, ("version",), version("1.3.0"), version("1.4.0"))
     assert classify(change, PLATFORM, POLICY, history).tier is tier
 
 
 def _req(tier: Tier, app: str | None = "demo", path: str = "config.X", env: str | None = "dev") -> Requirement:
-    change = Change(app, env, path, "a", "b")
+    change = Change(app, env, _path(path), "a", "b")
     return Requirement(app, tier, OWNERS if app is not None else (), (classify(change, PLATFORM, POLICY, {}),))
 
 
@@ -163,10 +172,21 @@ def test_break_glass_still_needs_someone_other_than_the_author() -> None:
     assert _decide(_req(Tier.PLATFORM, env="prod"), _proposal(PLATFORM_APPROVER, approved=(PLATFORM_APPROVER,), labels=(BREAK_GLASS,))).state == "pending"
 
 
+def test_break_glass_needs_an_approver_for_each_part_it_changes() -> None:
+    # Ann and Ben own demo. Their approval cannot carry a change to someone else's app, or to platform files.
+    other = Requirement("ledger", Tier.OWNER, ("carol@contoso.com", "dev@contoso.com"), ())
+    platform_files = _req(Tier.PLATFORM, app=None, path="platform_file.x", env=None)
+    glass = (BREAK_GLASS,)
+    assert decide([_req(Tier.OWNER), other], _proposal(ANN, approved=(BEN,), labels=glass), PLATFORM, IN_FREEZE).state == "pending"
+    assert decide([_req(Tier.OWNER), other], _proposal(ANN, approved=(BEN, "carol@contoso.com"), labels=glass), PLATFORM, IN_FREEZE).state == "succeeded"
+    assert decide([_req(Tier.OWNER), platform_files], _proposal(ANN, approved=(BEN,), labels=glass), PLATFORM, IN_FREEZE).state == "pending"
+    assert decide([_req(Tier.OWNER), platform_files], _proposal(ANN, approved=(PLATFORM_APPROVER,), labels=glass), PLATFORM, IN_FREEZE).state == "succeeded"
+
+
 def test_owners_come_from_the_target_branch_so_nobody_can_add_themselves_and_approve() -> None:
     base = fleet()
     head = fleet({"demo": (app_spec(owners=[ANN, STRANGER]), {"dev": env_spec(), "qa": env_spec(), "prod": env_spec()})})
-    finding = classify(Change("demo", None, "owners", OWNERS, (ANN, STRANGER)), PLATFORM, POLICY, {})
+    finding = classify(Change("demo", None, ("owners",), OWNERS, (ANN, STRANGER)), PLATFORM, POLICY, {})
     (req,) = requirements([finding], base, head)
     assert req.owners == OWNERS
     decision = decide([req], Proposal(STRANGER, Votes(frozenset({STRANGER}), frozenset()), frozenset()), PLATFORM, OUTSIDE_FREEZE)
@@ -175,7 +195,7 @@ def test_owners_come_from_the_target_branch_so_nobody_can_add_themselves_and_app
 
 def test_a_new_app_needs_a_co_owner_and_the_platform_team() -> None:
     head = fleet({"demo": (app_spec(), {"dev": env_spec()}), "fresh": (app_spec(name="fresh"), {"dev": env_spec()})})
-    finding = classify(Change("fresh", None, "app", None, "added"), PLATFORM, POLICY, {})
+    finding = classify(Change("fresh", None, ("app",), None, "added"), PLATFORM, POLICY, {})
     (req,) = requirements([finding], fleet(), head)
     assert req.owners == OWNERS
     only_platform = decide([req], Proposal(ANN, Votes(frozenset({PLATFORM_APPROVER}), frozenset()), frozenset()), PLATFORM, OUTSIDE_FREEZE)
@@ -185,5 +205,12 @@ def test_a_new_app_needs_a_co_owner_and_the_platform_team() -> None:
 
 def test_production_never_drops_below_owner_even_if_the_table_says_auto() -> None:
     loose = ReviewPolicy(rules=(Rule(reason="loosened", paths=("config.*",), tier={"dev": "auto", "qa": "auto", "prod": "auto"}),))
-    assert classify(Change("demo", "prod", "config.X", "a", "b"), PLATFORM, loose, {}).tier is Tier.OWNER
-    assert classify(Change("demo", "dev", "config.X", "a", "b"), PLATFORM, loose, {}).tier is Tier.AUTO
+    assert classify(Change("demo", "prod", ("config", "X"), "a", "b"), PLATFORM, loose, {}).tier is Tier.OWNER
+    assert classify(Change("demo", "dev", ("config", "X"), "a", "b"), PLATFORM, loose, {}).tier is Tier.AUTO
+
+
+@pytest.mark.parametrize(("author", "approved", "state"), [("carol@contoso.com", (), "succeeded"), (ANN, (), "pending"), (ANN, ("carol@contoso.com",), "succeeded")])
+def test_a_new_caller_needs_the_called_apps_owners(author: str, approved: tuple[str, ...], state: str) -> None:
+    finding = classify(Change("ledger", "dev", ("callers", "demo"), None, "added"), PLATFORM, POLICY, {})
+    req = Requirement("ledger", finding.tier, ("carol@contoso.com", "dev@contoso.com"), (finding,))
+    assert _decide(req, _proposal(author, approved)).state == state

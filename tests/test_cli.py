@@ -63,6 +63,25 @@ def test_hand_edited_rendered_output_fails_the_gate(repo: Path) -> None:
     assert "rendered/k8s/aks-prod/ledger-prod/manifests.yaml: stale" in out
 
 
+def test_a_new_caller_needs_the_called_apps_owners(repo: Path) -> None:
+    edit(repo / "apps/customer-portal/app.yaml", "talks_to: [payments-api/api]", "talks_to: [payments-api/api, ledger/api]")
+    out = review(repo, "--author", "erin.walsh@contoso.com", "--approve", "farid.haddad@contoso.com")
+    assert "ledger: owner review" in out
+    assert "callers.customer-portal" in out
+    assert "ledger: needs approval from an owner other than the author (carol.diaz@contoso.com, dev.patel@contoso.com)" in out
+    approved = review(repo, "--author", "erin.walsh@contoso.com", "--approve", "farid.haddad@contoso.com", "--approve", "carol.diaz@contoso.com")
+    assert "gate: succeeded" in approved
+
+
+def test_a_file_with_a_dot_in_its_name_is_an_application_setting(repo: Path) -> None:
+    edit(repo / "apps/payments-api/app.yaml", "secrets: [db-password, card-processor-key]", "files:\n  limits.toml: |\n    max = 1\nsecrets: [db-password, card-processor-key]")
+    git(repo, "commit", "-qam", "add a file")
+    edit(repo / "apps/payments-api/app.yaml", "max = 1", "max = 2")
+    out = review(repo, "--author", ALICE, "--approve", BOB)
+    assert "dev   files[limits.toml]  (1 line) -> (1 line)  auto" in out
+    assert "no review rule covers this path" not in out
+
+
 def test_a_production_setting_needs_the_other_owner(repo: Path) -> None:
     (repo / "apps/payments-api/prod.yaml").write_text((repo / "apps/payments-api/prod.yaml").read_text() + "config:\n  LOG_LEVEL: warn\n")
     pending = review(repo, "--author", ALICE)

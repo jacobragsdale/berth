@@ -11,7 +11,7 @@ from datetime import datetime
 from enum import IntEnum
 from typing import Literal
 
-from berth.diff import Change
+from berth.diff import Change, FieldPath, show
 from berth.fleet import Fleet
 from berth.model import Platform, ReviewPolicy
 
@@ -38,8 +38,8 @@ type History = Mapping[tuple[str, str], AbstractSet[str]]
 """Versions each (app, environment) has had on the target branch. Promotion checks read it."""
 
 
-def matches(pattern: str, path: str) -> bool:
-    """Dotted-path glob: `*` is one segment, `**` is any number of segments (including none)."""
+def matches(pattern: str, path: FieldPath) -> bool:
+    """Dotted glob over a field path: `*` is one key, `**` is any number of keys (including none)."""
 
     def walk(pat: list[str], parts: list[str]) -> bool:
         if not pat:
@@ -48,7 +48,7 @@ def matches(pattern: str, path: str) -> bool:
             return any(walk(pat[1:], parts[index:]) for index in range(len(parts) + 1))
         return bool(parts) and pat[0] in {"*", parts[0]} and walk(pat[1:], parts[1:])
 
-    return walk(pattern.split("."), path.split("."))
+    return walk(pattern.split("."), list(path))
 
 
 def _rule_tier(change: Change, policy: ReviewPolicy) -> tuple[Tier, str]:
@@ -68,11 +68,12 @@ def classify(change: Change, platform: Platform, policy: ReviewPolicy, history: 
     tier, reason = _rule_tier(change, policy)
     after, path = change.after, change.path
     escalations: list[str] = []
-    if path.endswith(".size") and isinstance(after, str) and after in platform.sizes and platform.sizes[after].platform_review:
+    if path[-1:] == ("size",) and isinstance(after, str) and after in platform.sizes and platform.sizes[after].platform_review:
         escalations.append(f"size {after} needs platform review")
-    if path.endswith((".replicas", ".autoscale.max")) and isinstance(after, int) and after > platform.max_replicas_without_review:
+    scaling = path[-1:] == ("replicas",) or path[-2:] == ("autoscale", "max")
+    if scaling and isinstance(after, int) and after > platform.max_replicas_without_review:
         escalations.append(f"more than {platform.max_replicas_without_review} replicas")
-    if path == "version" and change.app is not None and change.env is not None and isinstance(after, str):
+    if path == ("version",) and change.app is not None and change.env is not None and isinstance(after, str):
         source = platform.environments[change.env].promotes_from
         if source is not None and after not in history.get((change.app, source), set()):
             escalations.append(f"{after.split('@', 1)[0]} has not run in {source}")
@@ -165,18 +166,31 @@ def _bots(platform: Platform) -> set[str]:
     return {bot for bot in (platform.release_bot, platform.rightsizing_bot) if bot is not None}
 
 
-def _is_size(path: str) -> bool:
+def _is_size(path: FieldPath) -> bool:
     return matches("services.*.size", path) or matches("workflows.*.tasks.*.size", path)
 
 
 def _bot_overstep(reqs: list[Requirement], proposal: Proposal, platform: Platform) -> Decision | None:
     """A bot may change one kind of field and nothing else: versions for the release bot, sizes for rightsizing."""
     paths = {f.change.path for r in reqs for f in r.findings}
-    if proposal.author == platform.release_bot and (stray := sorted(p for p in paths if p != "version")):
+    if proposal.author == platform.release_bot and (stray := sorted(show(p) for p in paths if p != ("version",))):
         return Decision("failed", (f"the release bot may only change versions, but this changes {', '.join(stray)}",))
-    if proposal.author == platform.rightsizing_bot and (stray := sorted(p for p in paths if not _is_size(p))):
+    if proposal.author == platform.rightsizing_bot and (stray := sorted(show(p) for p in paths if not _is_size(p))):
         return Decision("failed", (f"the rightsizing bot may only change sizes, but this changes {', '.join(stray)}",))
     return None
+
+
+def _break_glass(reqs: list[Requirement], proposal: Proposal, approvers: AbstractSet[str]) -> Decision:
+    """Skip the freeze and the tiers, but not the people: each app it changes needs one approval from that app's owners
+    or the platform team, and platform files need the platform team. Co-owners of one app cannot vouch for another."""
+    missing: list[str] = []
+    for req in reqs:
+        pool = (set(req.owners) | approvers if req.app is not None else set(approvers)) - {proposal.author}
+        if not proposal.votes.approved & pool:
+            missing.append(f"{req.app or 'platform files'}: needs one approval from {_names(pool)}")
+    if missing:
+        return Decision("pending", ("break-glass: each part needs one approval from someone other than the author", *missing))
+    return Decision("succeeded", ("break-glass: approved; a platform review after the incident is required",))
 
 
 def decide(reqs: list[Requirement], proposal: Proposal, platform: Platform, now: datetime) -> Decision:
@@ -190,10 +204,7 @@ def decide(reqs: list[Requirement], proposal: Proposal, platform: Platform, now:
         return Decision("failed", tuple(rejected))
 
     if BREAK_GLASS in proposal.labels:
-        anyone = (approvers | {owner for r in reqs for owner in r.owners}) - {proposal.author}
-        if proposal.votes.approved & anyone:
-            return Decision("succeeded", ("break-glass: approved by one other person; a platform review after the incident is required",))
-        return Decision("pending", ("break-glass: needs approval from one owner or platform approver other than the author",))
+        return _break_glass(reqs, proposal, approvers)
 
     pending = _freezes(reqs, platform, now)
     satisfied: list[str] = []
