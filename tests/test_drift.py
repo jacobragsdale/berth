@@ -136,3 +136,26 @@ def test_a_deploy_selects_one_app_what_changed_or_everything(app: str | None, en
     selection = select(TARGETS, "aks-qa", app=app, env=env, changed=changed)
     assert [t.namespace for t in selection.targets] == namespaces
     assert selection.platform is platform
+
+
+def test_a_change_adopted_into_git_is_no_longer_by_hand() -> None:
+    # Someone scaled to 4, then the spec said 4 too: berth now co-owns .spec.replicas.
+    scaled = ManagedFields("kubectl", "Update", "scale", {"f:spec": {"f:replicas": {}}})
+    applied = ManagedFields("berth", "Apply", "", {"f:spec": {"f:replicas": {}, "f:template": {}}})
+    adopted = ref("Deployment", "payments-api-api", managed_fields=(scaled, applied))
+    assert hand_changes(adopted) == []
+    assert removal_patch(adopted) is None  # --revert must not delete a field git sets
+
+
+def _env(*items: tuple[str, dict[str, object]]) -> dict[str, object]:
+    """A fieldsV1 tree for environment variables of the container `main`."""
+    env = {f'k:{{"name":"{name}"}}': fields for name, fields in items}
+    return {"f:spec": {"f:template": {"f:spec": {"f:containers": {'k:{"name":"main"}': {"f:env": env}}}}}}
+
+
+def test_revert_removes_only_what_git_does_not_also_set() -> None:
+    whole: dict[str, object] = {".": {}, "f:name": {}, "f:value": {}}
+    edited = ManagedFields("kubectl-edit", "Update", "", _env(("BERTH_ENV", {"f:value": {}}), ("EXTRA", whole)))
+    applied = ManagedFields("berth", "Apply", "", _env(("BERTH_ENV", whole)))
+    patch = removal_patch(ref("Deployment", "ledger-api", managed_fields=(edited, applied)))
+    assert patch == {"spec": {"template": {"spec": {"containers": [{"name": "main", "env": [{"name": "EXTRA", "$patch": "delete"}]}]}}}}

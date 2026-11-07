@@ -111,7 +111,7 @@ def _apply_platform(site: Site, options: DeployOptions, out: TextIO) -> bool:
     if charts:
         version = site.kubectl.server_version()
         for release in charts:
-            out.write(f"rendering {release.name} ({release.spec.chart} {release.spec.version})\n")
+            out.write(f"rendering {release.name} ({release.spec.chart} {release.version})\n")
             steps.append((release.name, helm_template(site.tools.helm, template_args(release, version), values(release, site.fleet.platform))))
     steps += [("platform objects", site.tree[f"{base}/platform.yaml"]), ("admission policies", site.tree[f"{base}/admission.yaml"])]
     for label, manifests in steps:

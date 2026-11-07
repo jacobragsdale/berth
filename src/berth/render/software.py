@@ -18,6 +18,10 @@ class Release:
     spec: Software
     install: SoftwareInstall
 
+    @property
+    def version(self) -> str:
+        return self.install.version if self.install.version is not None else self.spec.version
+
 
 def releases(software: Mapping[str, Software], cluster: str) -> list[Release]:
     """The cluster's installs in deploy order: by `order`, then by name."""
@@ -56,5 +60,5 @@ def template_args(release: Release, kube_version: str | None) -> list[str]:
     """`helm template` arguments for one release, without the values file, which `berth.kube` supplies."""
     spec = release.spec
     location = ["--repo", spec.repo, spec.chart] if spec.repo.startswith("https://") else [f"{spec.repo}/{spec.chart}"]
-    args = ["template", release.name, *location, "--version", spec.version, "--namespace", release.install.namespace, "--include-crds"]
+    args = ["template", release.name, *location, "--version", release.version, "--namespace", release.install.namespace, "--include-crds"]
     return args + (["--kube-version", kube_version] if kube_version is not None else [])

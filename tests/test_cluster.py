@@ -129,6 +129,25 @@ def test_a_scale_by_hand_blocks_deploys_until_marked_break_glass_or_reverted(clu
     assert "payments-api-dev" not in cluster.drift()
 
 
+def test_a_change_adopted_into_the_spec_deploys_cleanly_and_stops_being_drift(cluster: Cluster) -> None:
+    env_file = cluster.repo / "apps/ledger/qa.yaml"
+    original = env_file.read_text()
+    assert cluster.kubectl("scale", "deployment/ledger-api", "-n", "ledger-qa", "--replicas=2").returncode == 0
+    assert "Deployment/ledger-api: kubectl: .spec.replicas" in cluster.drift()
+    try:
+        env_file.write_text(original + "services:\n  api: {replicas: 2}\n")
+        assert run(parse(["--root", str(cluster.repo), "render"]), io.StringIO(), NOW) == 0
+        _git(cluster.repo, "commit", "-qam", "keep two ledger replicas in qa")
+        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "ledger", "--env", "qa")
+        assert code == 0, out  # git now sets the same value, so there is no conflict
+        assert "ledger-qa" not in cluster.drift()
+    finally:
+        env_file.write_text(original)
+        assert run(parse(["--root", str(cluster.repo), "render"]), io.StringIO(), NOW) == 0
+        _git(cluster.repo, "commit", "-qam", "restore")
+        cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "ledger", "--env", "qa", "--revert")
+
+
 def test_an_object_made_by_hand_is_reported(cluster: Cluster) -> None:
     assert cluster.kubectl("create", "configmap", "tmp-fix", "-n", "ledger-qa", "--from-literal=a=b").returncode == 0
     assert "ledger-qa: made by hand: ConfigMap/tmp-fix; not marked" in cluster.drift()

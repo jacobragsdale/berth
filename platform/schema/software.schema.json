@@ -13,6 +13,19 @@
           "title": "Namespace",
           "type": "string"
         },
+        "version": {
+          "anyOf": [
+            {
+              "pattern": "^v?\\d+\\.\\d+\\.\\d+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        },
         "values": {
           "additionalProperties": true,
           "title": "Values",

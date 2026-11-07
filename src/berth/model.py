@@ -397,9 +397,13 @@ class SoftwareSecret(Spec):
     data: dict[Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9._-]+$")], Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9-]{1,127}$")]] = Field(min_length=1)
 
 
+ChartVersion = Annotated[str, StringConstraints(pattern=r"^v?\d+\.\d+\.\d+$")]  # exact: a range would change what runs without a commit
+
+
 class SoftwareInstall(Spec):
     cluster: ClusterName
     namespace: DnsLabel
+    version: ChartVersion | None = None  # overrides the shared version, to upgrade qa before prod
     values: dict[str, object] = Field(default_factory=dict)  # merged over the shared values (RFC 7386)
     secrets: dict[SecretName, SoftwareSecret] = Field(default_factory=dict)
 
@@ -414,7 +418,7 @@ class Software(Spec):
     description: Annotated[str, StringConstraints(min_length=1, max_length=200)]
     repo: Annotated[str, StringConstraints(pattern=r"^(https|oci)://\S+$")]
     chart: Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9-]*$")]
-    version: Annotated[str, StringConstraints(pattern=r"^v?\d+\.\d+\.\d+$")]  # exact: a range would change what runs without a commit
+    version: ChartVersion
     order: int = Field(default=0, ge=0, le=99)  # lower deploys first, e.g. CRDs other software needs
     values: dict[str, object] = Field(default_factory=dict)
     installs: dict[DnsLabel, SoftwareInstall] = Field(min_length=1)  # by Helm release name

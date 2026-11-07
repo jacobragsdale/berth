@@ -3,9 +3,12 @@
 #
 # Azure DevOps schedules in UTC: 13:00 UTC is 9:00 in New York in summer and 8:00 in winter.
 #
-# Not yet run in Azure DevOps. Needs a read-only service connection berth-aks-read (an identity that can get and
-# list in berth's namespaces on both clusters), and a variable group berth-drift holding SLACK_WEBHOOK_URL, linked
-# to Key Vault.
+# Each cluster gets its own message, from its own step, with that cluster's deploy identity. `kubectl diff` is a
+# server-side dry run, and Kubernetes RBAC cannot grant "dry run only", so a read-only identity cannot check drift.
+# berth drift itself never writes.
+#
+# Not yet run in Azure DevOps. Uses the deploy pipeline's service connections (berth-aks-qa, berth-aks-prod) and a
+# variable group berth-drift holding SLACK_WEBHOOK_URL, linked to Key Vault.
 trigger: none
 pr: none
 schedules:
@@ -26,21 +29,21 @@ steps:
   - template: templates/setup-uv.yml
   - script: scripts/fetch-tools.sh
     displayName: Pinned kubectl
-  # One task: kubelogin borrows the Azure CLI's sign-in, which ends when the task does.
-  - task: AzureCLI@2
-    displayName: berth drift
-    inputs:
-      azureSubscription: berth-aks-read
-      scriptType: bash
-      scriptLocation: inlineScript
-      inlineScript: |
-        set -euo pipefail
-        for cluster in aks-qa aks-prod; do
-          az aks get-credentials --resource-group "rg-$cluster" --name "$cluster" --context "$cluster" --overwrite-existing
-        done
-        kubelogin convert-kubeconfig -l azurecli
-        uv run berth drift --cluster aks-qa --cluster aks-prod --slack --details "$(Agent.TempDirectory)/drift.txt"
-        echo "##vso[task.uploadfile]$(Agent.TempDirectory)/drift.txt"
-    env:
-      BERTH_KUBECTL: $(Build.SourcesDirectory)/.tools/bin/kubectl
-      SLACK_WEBHOOK_URL: $(SLACK_WEBHOOK_URL)
+  # kubelogin borrows the Azure CLI's sign-in, which ends with the task, so each cluster is one task.
+  - ${{ each cluster in split('aks-qa,aks-prod', ',') }}:
+      - task: AzureCLI@2
+        displayName: berth drift on ${{ cluster }}
+        condition: always()  # one cluster's failure must not hide the other's report
+        inputs:
+          azureSubscription: berth-${{ cluster }}
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            az aks get-credentials --resource-group rg-${{ cluster }} --name ${{ cluster }} --context ${{ cluster }} --overwrite-existing
+            kubelogin convert-kubeconfig -l azurecli
+            uv run berth drift --cluster ${{ cluster }} --slack --details "$(Agent.TempDirectory)/drift-${{ cluster }}.txt"
+            echo "##vso[task.uploadfile]$(Agent.TempDirectory)/drift-${{ cluster }}.txt"
+        env:
+          BERTH_KUBECTL: $(Build.SourcesDirectory)/.tools/bin/kubectl
+          SLACK_WEBHOOK_URL: $(SLACK_WEBHOOK_URL)

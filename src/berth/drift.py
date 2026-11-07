@@ -43,7 +43,8 @@ MANAGED_TYPES = (
     "httproutes.gateway.networking.k8s.io",
 )
 # Also looked at for hand-made objects: things people create in an emergency.
-EXTRA_TYPES = ("secrets", "pods", "jobs.batch", "statefulsets.apps", "daemonsets.apps", "ingresses.networking.k8s.io", "roles.rbac.authorization.k8s.io")
+# Not Secrets: External Secrets owns the ones apps use, and the report has no reason to read the rest.
+EXTRA_TYPES = ("pods", "jobs.batch", "statefulsets.apps", "daemonsets.apps", "ingresses.networking.k8s.io", "roles.rbac.authorization.k8s.io")
 # Created by Kubernetes itself in every namespace.
 _BUILT_IN = frozenset({("ServiceAccount", "default"), ("ConfigMap", "kube-root-ca.crt")})
 _NEVER_PRUNED = frozenset({"Namespace", "PersistentVolumeClaim"})
@@ -194,26 +195,76 @@ def _part(key: str) -> str:
     return f"[{rest}]"
 
 
-def hand_changes(ref: ObjectRef) -> list[str]:
-    """`manager: path` for every field a person set, rather than berth or a Kubernetes controller."""
-    found: list[str] = []
-    for entry in ref.managed_fields:
-        if entry.subresource == "status" or entry.manager in EXPECTED_MANAGERS:
+def _owned(fields: Mapping[str, object], prefix: str = "") -> set[str]:
+    """Every path a fieldsV1 tree owns: each leaf field, and each list item it owns as an item (`.`).
+
+    Owning an item is not owning its fields: berth owns the container `main` and the fields it sets in it, and an
+    environment variable someone else added to `main` is still theirs.
+    """
+    paths: set[str] = set()
+    for key, child in fields.items():
+        if key == ".":
             continue
-        found += [f"{entry.manager}: {path}" for path in field_paths(entry.fields) if path not in _HARMLESS and not path.startswith(".metadata.managedFields")]
-    return found
+        path = prefix + _part(key)
+        tree = {str(k): v for k, v in child.items()} if isinstance(child, dict) else {}
+        if not tree or "." in tree:
+            paths.add(path)
+        paths |= _owned(tree, path)
+    return paths
+
+
+def _berths(ref: ObjectRef) -> set[str]:
+    """The paths berth itself applied. A field berth also owns has been adopted: git now says the same thing."""
+    return {path for entry in ref.managed_fields if entry.manager == FIELD_MANAGER for path in _owned(entry.fields)}
+
+
+def _covered(path: str, ours: set[str]) -> bool:
+    return path in ours
+
+
+def _people(ref: ObjectRef) -> list[tuple[str, Mapping[str, object]]]:
+    return [(entry.manager, entry.fields) for entry in ref.managed_fields if entry.subresource != "status" and entry.manager not in EXPECTED_MANAGERS]
+
+
+def hand_changes(ref: ObjectRef) -> list[str]:
+    """`manager: path` for every field a person set that git does not also set."""
+    ours = _berths(ref)
+    return [
+        f"{manager}: {path}"
+        for manager, fields in _people(ref)
+        for path in field_paths(fields)
+        if path not in _HARMLESS and not path.startswith(".metadata.managedFields") and not _covered(path, ours)
+    ]
 
 
 def removal_patch(ref: ObjectRef) -> dict[str, object] | None:
-    """A strategic merge patch deleting every field a person added, or None if the kind cannot take one."""
+    """A strategic merge patch deleting every field a person added and git does not set, or None if none can be built."""
     if ref.kind not in _PATCHABLE:
         return None
+    ours = _berths(ref)
     patch: dict[str, object] = {}
-    for entry in ref.managed_fields:
-        if entry.subresource == "status" or entry.manager in EXPECTED_MANAGERS:
-            continue
-        _merge(patch, _removal(entry.fields))
+    for _, fields in _people(ref):
+        _merge(patch, _removal(_without(fields, ours)))
     return patch or None
+
+
+def _without(fields: Mapping[str, object], ours: set[str], prefix: str = "") -> dict[str, object]:
+    """The part of a fieldsV1 tree that berth does not also own."""
+    kept: dict[str, object] = {}
+    for key, child in fields.items():
+        if key == ".":
+            kept[key] = child
+            continue
+        path = prefix + _part(key)
+        tree = {str(k): v for k, v in child.items()} if isinstance(child, dict) else {}
+        if tree and "." not in tree:
+            # Only a path through the tree, such as the container `main`: what matters is beneath it.
+            inner = _without(tree, ours, path)
+            if inner:
+                kept[key] = inner
+        elif not _covered(path, ours):
+            kept[key] = child
+    return kept
 
 
 def _removal(fields: Mapping[str, object]) -> dict[str, object]:

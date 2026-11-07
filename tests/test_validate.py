@@ -3,6 +3,7 @@
 from support import app_spec, env_spec, tree
 
 from berth.fleet import load
+from berth.render.software import releases, template_args
 from berth.validate import problems
 
 ENVOY = """
@@ -54,3 +55,9 @@ def test_every_environment_on_a_cluster_needs_its_gateway_certificate() -> None:
 def test_software_cannot_take_an_app_namespace() -> None:
     found = _problems(tree() | {"platform/software/envoy-gateway.yaml": ENVOY.replace("namespace: envoy-gateway-system", "namespace: demo-dev")})
     assert any("'demo-dev' is already an app namespace" in problem for problem in found)
+
+
+def test_one_install_can_run_a_newer_chart_to_upgrade_qa_first() -> None:
+    fleet = load(tree() | {"platform/software/envoy-gateway.yaml": ENVOY.replace("    namespace: envoy-gateway-system\n", "    namespace: envoy-gateway-system\n    version: v1.10.0\n")})
+    (release,) = releases(fleet.software, "aks-qa")
+    assert template_args(release, None)[template_args(release, None).index("--version") + 1] == "v1.10.0"
