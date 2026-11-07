@@ -1,0 +1,68 @@
+# For app repositories. Their pipeline triggers on a git tag, builds the image tagged with it, and calls this:
+#
+#   trigger: {tags: {include: ['*']}}
+#   resources:
+#     repositories:
+#       - repository: berth
+#         type: git
+#         name: platform/berth
+#   steps:
+#     - template: pipelines/templates/release.yml@berth
+#       parameters: {app: payments-api}
+#
+# It pushes the image to ACR, then opens a pull request in the deploy repo that sets the dev version to
+# tag@digest. The gate lets the release bot merge that alone, because it may only change versions and dev is
+# auto-tier. qa and prod are promoted by people with `berth promote`.
+#
+# The pull request's author must be platform.yaml's release_bot. Use a dedicated identity rather than the
+# shared build service, which every pipeline in the project runs as.
+#
+# Not yet run in Azure DevOps.
+parameters:
+  - name: app
+    type: string
+  - name: registry
+    type: string
+    default: contosoacr
+  - name: acrConnection
+    type: string
+    default: contosoacr  # Docker registry service connection
+  - name: dockerfile
+    type: string
+    default: Dockerfile
+
+steps:
+  - checkout: self
+  - checkout: berth
+    path: berth
+
+  - task: Docker@2
+    displayName: Build and push ${{ parameters.app }}:$(Build.SourceBranchName)
+    inputs:
+      command: buildAndPush
+      containerRegistry: ${{ parameters.acrConnection }}
+      repository: ${{ parameters.app }}
+      Dockerfile: ${{ parameters.dockerfile }}
+      tags: $(Build.SourceBranchName)
+
+  - task: AzureCLI@2
+    displayName: Open the dev release pull request
+    inputs:
+      azureSubscription: berth-release  # the release bot identity
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        tag="$(Build.SourceBranchName)"
+        digest=$(az acr repository show --name "${{ parameters.registry }}" --image "${{ parameters.app }}:$tag" --query digest -o tsv)
+        cd "$(Pipeline.Workspace)/berth"
+        branch="release/${{ parameters.app }}/$tag"
+        git checkout -b "$branch"
+        curl -LsSf https://astral.sh/uv/0.13.6/install.sh | sh && export PATH="$HOME/.local/bin:$PATH"
+        uv run berth release "${{ parameters.app }}" --env dev --version "$tag@$digest"
+        uv run berth render
+        git add apps rendered
+        git -c user.name="berth release" -c user.email=berth-release@contoso.com commit -m "release ${{ parameters.app }} $tag to dev"
+        git push origin "$branch"
+        az repos pr create --repository berth --source-branch "$branch" --target-branch main \
+          --title "release ${{ parameters.app }} $tag to dev" --auto-complete true --delete-source-branch true

@@ -1,0 +1,28 @@
+# Admission backstops. berth already renders everything this way; these catch anything that bypasses the
+# renderer (an override, a hand-applied manifest, a scheduler bug) at the API server.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: berth-images
+spec:
+  validationActions: [Deny]
+  matchConstraints:
+    objectSelector:
+      matchLabels: {app.kubernetes.io/managed-by: berth}
+    resourceRules:
+      - {apiGroups: [""], apiVersions: [v1], operations: [CREATE, UPDATE], resources: [pods]}
+      - {apiGroups: [apps], apiVersions: [v1], operations: [CREATE, UPDATE], resources: [deployments]}
+      - {apiGroups: [batch], apiVersions: [v1], operations: [CREATE, UPDATE], resources: [jobs, cronjobs]}
+  variables:
+    # Written out rather than left to autogen: the Kyverno CLI does not apply autogen rules, and CI must
+    # check the same objects the cluster does.
+    - name: pod
+      expression: >-
+        object.kind == 'Pod' ? object.spec :
+        object.kind == 'CronJob' ? object.spec.jobTemplate.spec.template.spec :
+        object.spec.template.spec
+  validations:
+    - message: Images must come from contosoacr.azurecr.io and be pinned by digest (tag@sha256:...).
+      expression: >-
+        (variables.pod.containers + variables.pod.?initContainers.orValue([])).all(c,
+          c.image.startsWith('contosoacr.azurecr.io/') && c.image.matches('@sha256:[0-9a-f]{64}$'))

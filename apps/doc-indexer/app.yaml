@@ -1,0 +1,21 @@
+# yaml-language-server: $schema=../../platform/schema/app.schema.json
+# A worker (no port) with a disk. Not in production yet.
+name: doc-indexer
+description: Builds the search index for internal documents
+owners:
+  - ivy.chen@contoso.com
+  - jon.reyes@contoso.com
+source: https://dev.azure.com/contoso/search/_git/doc-indexer
+
+services:
+  worker:
+    command: [indexer, run, --index-dir, /var/lib/indexer]
+    size: m
+    volumes:
+      index: {path: /var/lib/indexer, size_gi: 20}
+
+files:
+  indexer.toml: |
+    [sources]
+    sharepoint = true
+    confluence = true

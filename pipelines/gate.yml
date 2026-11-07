@@ -1,0 +1,59 @@
+# The merge gate. Posts the berth/review status that the branch policy on main requires.
+#
+# Why a separate pipeline: build validation runs the pull request's own YAML and code, so it cannot judge the
+# pull request. This pipeline is triggered by a webhook, so Azure Pipelines always runs main's copy of this
+# file, and it runs main's berth against the pull request's tree. It also runs again when someone votes:
+# build validation does not, because Azure Repos queues builds only on create and push.
+#
+# Setup (platform team, once):
+#   1. An Incoming WebHook service connection named berth-pr-events.
+#   2. Service hooks on the repo for "Pull request created" and "Pull request updated" (which includes
+#      reviewer votes) posting to that webhook.
+#   3. A variable group berth-gate, linked to Key Vault, holding BERTH_GATE_TOKEN for a dedicated identity.
+#      Grant pipeline permission on the group to this pipeline only.
+#   4. Branch policy on main: require status berth/review, with "authorized identity" set to that identity,
+#      so a status posted by any other pipeline does not count.
+#
+# Not yet run in Azure DevOps; the webhook payload path below follows the documented resources.webhooks syntax.
+trigger: none
+pr: none
+
+resources:
+  webhooks:
+    - webhook: prEvents
+      connection: berth-pr-events
+
+variables:
+  - group: berth-gate
+  - name: PR_ID
+    value: ${{ parameters.prEvents.resource.pullRequestId }}
+
+pool:
+  vmImage: ubuntu-24.04
+
+steps:
+  - checkout: self  # main: the berth code, policy and approvers that judge the pull request
+    path: trusted
+    fetchDepth: 0
+
+  - script: |
+      set -euo pipefail
+      cd "$(Pipeline.Workspace)/trusted"
+      git fetch --no-tags origin "+refs/pull/$(PR_ID)/merge:refs/remotes/pr/merge"
+      git worktree add --detach "$(Pipeline.Workspace)/pr" refs/remotes/pr/merge
+    displayName: Check out the pull request's merge commit beside main
+
+  - template: templates/setup-uv.yml
+    parameters:
+      project: $(Pipeline.Workspace)/trusted
+
+  - script: |
+      set -euo pipefail
+      uv run --project "$(Pipeline.Workspace)/trusted" berth --root "$(Pipeline.Workspace)/pr" gate \
+        --pr "$(PR_ID)" --base origin/main \
+        --target-url "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)" \
+        --summary "$(Agent.TempDirectory)/review.md"
+      echo "##vso[task.uploadsummary]$(Agent.TempDirectory)/review.md"
+    displayName: Evaluate and post berth/review
+    env:
+      SYSTEM_ACCESSTOKEN: $(BERTH_GATE_TOKEN)

@@ -1,0 +1,73 @@
+# Flux bootstrap for aks-qa, applied once by the platform team (or expressed as a microsoft.flux fluxConfiguration).
+# Flux then applies rendered/k8s/aks-qa/: _platform/ first, then one Kustomization per app environment from _flux/,
+# so one broken app cannot stall the others. Assumes External Secrets Operator and Kyverno are installed by a
+# Kustomization named platform-addons. Not yet applied to a real cluster.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: berth
+  namespace: flux-system
+spec:
+  interval: 1m
+  url: https://dev.azure.com/contoso/platform/_git/berth
+  ref:
+    branch: main
+  provider: azure  # workload identity to Azure DevOps; no PAT
+  ignore: |
+    /*
+    !/rendered/k8s/aks-qa/
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: berth-platform
+  namespace: flux-system
+spec:
+  interval: 10m
+  path: ./rendered/k8s/aks-qa/_platform
+  prune: true
+  wait: true
+  sourceRef:
+    kind: GitRepository
+    name: berth
+  dependsOn:
+    - name: platform-addons
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: berth-apps
+  namespace: flux-system
+spec:
+  interval: 10m
+  path: ./rendered/k8s/aks-qa/_flux
+  prune: true  # removing an app's Kustomization removes its workloads; namespaces and volumes are kept
+  sourceRef:
+    kind: GitRepository
+    name: berth
+  dependsOn:
+    - name: berth-platform
+---
+# Deploy status back on the commit in Azure DevOps, one status per app environment.
+apiVersion: notification.toolkit.fluxcd.io/v1beta3
+kind: Provider
+metadata:
+  name: azure-devops
+  namespace: flux-system
+spec:
+  type: azuredevops
+  address: https://dev.azure.com/contoso/platform/_git/berth
+  secretRef:
+    name: azure-devops-status-token
+---
+apiVersion: notification.toolkit.fluxcd.io/v1beta3
+kind: Alert
+metadata:
+  name: berth-commit-status
+  namespace: flux-system
+spec:
+  providerRef:
+    name: azure-devops
+  eventSources:
+    - kind: Kustomization
+      name: "*"

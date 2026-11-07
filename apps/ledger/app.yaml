@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=../../platform/schema/app.schema.json
+name: ledger
+description: Double-entry ledger service and end-of-day reconciliation
+owners:
+  - carol.diaz@contoso.com
+  - dev.patel@contoso.com
+source: https://dev.azure.com/contoso/finance/_git/ledger
+
+# Reads from Azure SQL with Entra auth, so it needs a managed identity (platform-provisioned).
+azure_identity: true
+
+services:
+  api:
+    port: 8080
+    health: {path: /health/ready}
+    size: m
+
+workflows:
+  reconcile:
+    orchestrator: controlm
+    schedule: 30 18 * * 1-5
+    timezone: America/New_York
+    tasks:
+      extract:
+        command: [ledger, export, --since, yesterday]
+        timeout: 20m
+      match:
+        command: [ledger, reconcile]
+        size: l
+        timeout: 1h
+        retries: 1
+        depends_on: [extract]
+      report:
+        command: [ledger, report, --email]
+        size: xs
+        depends_on: [match]
+
+config:
+  LOG_LEVEL: info
+secrets: [sql-connection]

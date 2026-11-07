@@ -1,0 +1,19 @@
+# yaml-language-server: $schema=../../platform/schema/app.schema.json
+name: customer-portal
+description: Customer-facing web portal
+owners:
+  - erin.walsh@contoso.com
+  - farid.haddad@contoso.com
+source: https://dev.azure.com/contoso/web/_git/customer-portal
+
+services:
+  web:
+    port: 3000
+    health: {path: /api/health}
+    size: s
+    expose: public
+    hostname: portal
+
+config:
+  NODE_ENV: production
+talks_to: [payments-api/api]

@@ -1,0 +1,471 @@
+{
+  "$defs": {
+    "Autoscale": {
+      "additionalProperties": false,
+      "properties": {
+        "min": {
+          "minimum": 1,
+          "title": "Min",
+          "type": "integer"
+        },
+        "max": {
+          "minimum": 1,
+          "title": "Max",
+          "type": "integer"
+        },
+        "cpu_percent": {
+          "default": 70,
+          "maximum": 95,
+          "minimum": 10,
+          "title": "Cpu Percent",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "min",
+        "max"
+      ],
+      "title": "Autoscale",
+      "type": "object"
+    },
+    "Health": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "pattern": "^/\\S*$",
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "Health",
+      "type": "object"
+    },
+    "Override": {
+      "additionalProperties": false,
+      "description": "An RFC 7386 JSON merge patch applied to one rendered object: the escape hatch for what the spec cannot say.",
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/OverrideTarget"
+        },
+        "patch": {
+          "additionalProperties": true,
+          "minProperties": 1,
+          "title": "Patch",
+          "type": "object"
+        },
+        "reason": {
+          "minLength": 10,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "patch",
+        "reason"
+      ],
+      "title": "Override",
+      "type": "object"
+    },
+    "OverrideTarget": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "pattern": "^[A-Z][A-Za-z]+$",
+          "title": "Kind",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "name"
+      ],
+      "title": "OverrideTarget",
+      "type": "object"
+    },
+    "Service": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "anyOf": [
+            {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command"
+        },
+        "args": {
+          "anyOf": [
+            {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Args"
+        },
+        "port": {
+          "anyOf": [
+            {
+              "maximum": 65535,
+              "minimum": 1024,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Port"
+        },
+        "health": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Health"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "size": {
+          "default": "s",
+          "pattern": "^[a-z0-9]{1,8}$",
+          "title": "Size",
+          "type": "string"
+        },
+        "replicas": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Replicas"
+        },
+        "autoscale": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Autoscale"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "expose": {
+          "default": "internal",
+          "enum": [
+            "internal",
+            "public"
+          ],
+          "title": "Expose",
+          "type": "string"
+        },
+        "hostname": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hostname"
+        },
+        "volumes": {
+          "patternProperties": {
+            "^[a-z](?:[a-z0-9-]{0,18}[a-z0-9])?$": {
+              "$ref": "#/$defs/Volume"
+            }
+          },
+          "title": "Volumes",
+          "type": "object"
+        }
+      },
+      "title": "Service",
+      "type": "object"
+    },
+    "Task": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "anyOf": [
+            {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command"
+        },
+        "args": {
+          "anyOf": [
+            {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Args"
+        },
+        "size": {
+          "default": "s",
+          "pattern": "^[a-z0-9]{1,8}$",
+          "title": "Size",
+          "type": "string"
+        },
+        "timeout": {
+          "default": "1h",
+          "title": "Timeout",
+          "type": "string"
+        },
+        "retries": {
+          "default": 0,
+          "maximum": 5,
+          "minimum": 0,
+          "title": "Retries",
+          "type": "integer"
+        },
+        "depends_on": {
+          "default": [],
+          "items": {
+            "pattern": "^[a-z](?:[a-z0-9-]{0,18}[a-z0-9])?$",
+            "type": "string"
+          },
+          "title": "Depends On",
+          "type": "array"
+        }
+      },
+      "title": "Task",
+      "type": "object"
+    },
+    "Volume": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "pattern": "^/[A-Za-z0-9_./-]+$",
+          "title": "Path",
+          "type": "string"
+        },
+        "size_gi": {
+          "maximum": 1024,
+          "minimum": 1,
+          "title": "Size Gi",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "size_gi"
+      ],
+      "title": "Volume",
+      "type": "object"
+    },
+    "Workflow": {
+      "additionalProperties": false,
+      "properties": {
+        "orchestrator": {
+          "enum": [
+            "airflow",
+            "controlm",
+            "kubernetes"
+          ],
+          "title": "Orchestrator",
+          "type": "string"
+        },
+        "schedule": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Schedule"
+        },
+        "timezone": {
+          "default": "UTC",
+          "title": "Timezone",
+          "type": "string"
+        },
+        "tasks": {
+          "minProperties": 1,
+          "patternProperties": {
+            "^[a-z](?:[a-z0-9-]{0,18}[a-z0-9])?$": {
+              "$ref": "#/$defs/Task"
+            }
+          },
+          "title": "Tasks",
+          "type": "object"
+        }
+      },
+      "required": [
+        "orchestrator",
+        "tasks"
+      ],
+      "title": "Workflow",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+      "title": "Name",
+      "type": "string"
+    },
+    "description": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Description",
+      "type": "string"
+    },
+    "owners": {
+      "items": {
+        "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+        "type": "string"
+      },
+      "minItems": 2,
+      "title": "Owners",
+      "type": "array"
+    },
+    "source": {
+      "pattern": "^https://\\S+$",
+      "title": "Source",
+      "type": "string"
+    },
+    "image": {
+      "anyOf": [
+        {
+          "pattern": "^[a-z0-9]+([._/-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Image"
+    },
+    "config": {
+      "patternProperties": {
+        "^[A-Z_][A-Z0-9_]*$": {
+          "type": "string"
+        }
+      },
+      "title": "Config",
+      "type": "object"
+    },
+    "files": {
+      "patternProperties": {
+        "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}$": {
+          "type": "string"
+        }
+      },
+      "title": "Files",
+      "type": "object"
+    },
+    "secrets": {
+      "default": [],
+      "items": {
+        "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+        "type": "string"
+      },
+      "title": "Secrets",
+      "type": "array"
+    },
+    "talks_to": {
+      "default": [],
+      "items": {
+        "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?/[a-z](?:[a-z0-9-]{0,18}[a-z0-9])?$",
+        "type": "string"
+      },
+      "title": "Talks To",
+      "type": "array"
+    },
+    "azure_identity": {
+      "default": false,
+      "title": "Azure Identity",
+      "type": "boolean"
+    },
+    "services": {
+      "patternProperties": {
+        "^[a-z](?:[a-z0-9-]{0,18}[a-z0-9])?$": {
+          "$ref": "#/$defs/Service"
+        }
+      },
+      "title": "Services",
+      "type": "object"
+    },
+    "workflows": {
+      "patternProperties": {
+        "^[a-z](?:[a-z0-9-]{0,18}[a-z0-9])?$": {
+          "$ref": "#/$defs/Workflow"
+        }
+      },
+      "title": "Workflows",
+      "type": "object"
+    },
+    "overrides": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Override"
+      },
+      "title": "Overrides",
+      "type": "array"
+    }
+  },
+  "required": [
+    "name",
+    "description",
+    "owners",
+    "source"
+  ],
+  "title": "App",
+  "type": "object"
+}

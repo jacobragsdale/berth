@@ -1,0 +1,4 @@
+# yaml-language-server: $schema=../../platform/schema/env.schema.json
+version: 1.5.0-rc.2@sha256:26d2f4b0569bd2a26cecf7109077b6ca75d9768f30f576a5b829b49b4c91e445
+config:
+  LOG_LEVEL: debug

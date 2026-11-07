@@ -1,0 +1,13 @@
+parameters:
+  - name: project
+    type: string
+    default: $(Build.SourcesDirectory)
+
+steps:
+  - script: |
+      set -euo pipefail
+      curl -LsSf https://astral.sh/uv/0.13.6/install.sh | sh
+      echo "##vso[task.prependpath]$HOME/.local/bin"
+    displayName: Install uv 0.13.6
+  - script: uv sync --locked --project "${{ parameters.project }}"
+    displayName: Install berth

@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=../../platform/schema/app.schema.json
+# Jobs only: no services. One workflow on Control-M, one plain Kubernetes CronJob.
+name: risk-batch
+description: Overnight value-at-risk runs and scratch-data cleanup
+owners:
+  - grace.kim@contoso.com
+  - hiro.tanaka@contoso.com
+source: https://dev.azure.com/contoso/risk/_git/risk-batch
+
+workflows:
+  var:
+    orchestrator: controlm
+    schedule: 0 21 * * 1-5
+    timezone: America/New_York
+    tasks:
+      compute:
+        command: [python, -m, risk.var, --confidence, "0.99"]
+        size: l
+        timeout: 3h
+  cleanup:
+    orchestrator: kubernetes
+    schedule: 15 3 * * *
+    tasks:
+      purge:
+        command: [python, -m, risk.cleanup, --older-than, 7d]
+        size: xs
+        timeout: 15m
+
+secrets: [warehouse-password]

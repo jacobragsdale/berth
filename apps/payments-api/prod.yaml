@@ -1,0 +1,5 @@
+# yaml-language-server: $schema=../../platform/schema/env.schema.json
+version: 1.4.2@sha256:b226796370094390ac172df8cd5d06d54247c5f91b7a4faf909213ac19ab6900
+services:
+  api:
+    autoscale: {min: 3, max: 8}

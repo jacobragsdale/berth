@@ -1,0 +1,18 @@
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: berth-ownership
+spec:
+  validationActions: [Deny]
+  matchConstraints:
+    objectSelector:
+      matchLabels: {app.kubernetes.io/managed-by: berth}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [namespaces]
+  validations:
+    - message: App namespaces must name at least two owners in the berth.contoso.io/app-owners annotation.
+      expression: >-
+        object.metadata.?annotations[?'berth.contoso.io/app-owners'].orValue('').split(',').filter(o, o.contains('@')).size() >= 2

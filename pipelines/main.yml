@@ -1,0 +1,45 @@
+# After a merge to main. Flux applies rendered/k8s/ by itself and Airflow reads rendered/airflow/<env>/ as a
+# Git DAG bundle, so the only push left is Control-M, which has no pull-based sync.
+#
+# Each environment is an Azure Pipelines environment (berth-controlm-<env>), which gives a deployment history
+# and a place for checks that do not live in YAML (business hours for prod, for example). Approval already
+# happened on the pull request, so there is no approval check here.
+#
+# Not yet run. The ctm commands follow BMC's Automation API docs, which could not be fetched directly when this
+# was written; confirm them against your Control-M version.
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [rendered/controlm]
+pr: none
+
+pool:
+  vmImage: ubuntu-24.04
+
+stages:
+  - ${{ each env in split('dev,qa,prod', ',') }}:
+      - stage: controlm_${{ env }}
+        displayName: Control-M ${{ env }}
+        jobs:
+          - deployment: deploy
+            environment: berth-controlm-${{ env }}
+            variables:
+              - group: berth-controlm-${{ env }}  # CTM_ENDPOINT, CTM_TOKEN (Key Vault-linked)
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: self
+                    - script: |
+                        set -euo pipefail
+                        shopt -s nullglob
+                        files=(rendered/controlm/${{ env }}/*.json)
+                        if (( ${#files[@]} == 0 )); then echo "nothing to deploy"; exit 0; fi
+                        curl -fsSL "$(CTM_ENDPOINT)/ctm-cli.tgz" -o ctm-cli.tgz
+                        npm install -g ctm-cli.tgz
+                        ctm environment add berth "$(CTM_ENDPOINT)" "$(CTM_TOKEN)"
+                        for f in "${files[@]}"; do ctm deploy "$f" -e berth; done
+                      displayName: ctm deploy
+                      # TODO: delete folders that disappeared from rendered/ (ctm deploy only adds and updates),
+                      # and run a nightly drift check comparing deployed folders with rendered/.

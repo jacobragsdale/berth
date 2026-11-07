@@ -1,0 +1,31 @@
+# rendered/ is generated: fixers must not touch it, and `berth check` already proves it matches the specs.
+exclude: ^rendered/
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--allow-multiple-documents]  # Kubernetes manifests and Kyverno fixtures are multi-document
+      - id: check-toml
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.3
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.13.6   # keep in sync with the uv version the repo is built with
+    hooks:
+      - id: uv-lock   # fails the commit if pyproject.toml changed without uv.lock
+
+  - repo: https://github.com/astral-sh/ty-pre-commit
+    rev: v0.0.95   # keep in sync with the pinned ty dev dependency
+    hooks:
+      - id: ty

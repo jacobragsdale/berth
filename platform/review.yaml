@@ -1,0 +1,67 @@
+# Who must approve what. Each change is a dotted path into one app's spec for one environment
+# (app.yaml merged with <env>.yaml). The first rule whose path matches decides the tier:
+#
+#   auto      no approval when an owner (or the release bot, for versions) opens the pull request
+#   owner     another owner of the app approves
+#   platform  an owner and a platform approver both approve
+#
+# `*` matches one path segment and `**` any number. A path no rule matches needs platform review, and so
+# does anything outside apps/. Production never drops below owner. Code adds three escalations on top of
+# this table (see src/berth/review.py): sizes marked platform_review, replicas above
+# max_replicas_without_review, and a version that has not run in the environment it promotes from.
+rules:
+  - reason: a new version
+    paths: [version]
+    tier: {dev: auto, qa: auto, prod: owner}
+
+  - reason: application settings
+    paths: [config.*, files.*, secrets, talks_to]
+    tier: {dev: auto, qa: auto, prod: owner}
+
+  - reason: how a service runs
+    paths:
+      - services.*.command
+      - services.*.args
+      - services.*.port
+      - services.*.health.**
+      - services.*.size
+      - services.*.replicas
+      - services.*.autoscale.**
+      - services.*.expose   # internal is fine; public escalates in code
+    tier: {dev: auto, qa: auto, prod: owner}
+
+  - reason: what a workflow runs and when
+    paths: [workflows.**]
+    tier: {dev: auto, qa: auto, prod: owner}
+
+  - reason: a public hostname
+    paths: [services.*.hostname]
+    tier: platform
+
+  - reason: persistent storage
+    paths: [services.*.volumes.**]
+    tier: platform
+
+  - reason: access to Azure resources
+    paths: [azure_identity]
+    tier: platform
+
+  - reason: the escape hatch (raw patches to rendered objects)
+    paths: [overrides]
+    tier: platform
+
+  - reason: ownership and description
+    paths: [owners, description, source, image]
+    tier: owner
+
+  - reason: other files in the app's directory
+    paths: [repo_file.**]
+    tier: owner
+
+  - reason: starting or stopping an app in an environment
+    paths: [environment]
+    tier: {dev: auto, qa: owner, prod: platform}
+
+  - reason: a new or retired app
+    paths: [app]
+    tier: platform

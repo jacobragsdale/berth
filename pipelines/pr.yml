@@ -1,0 +1,37 @@
+# Build validation for pull requests into main (Branch policy > Build validation > this pipeline, required).
+#
+# This runs the pull request's own copy of this file and of berth, so it proves the change is well formed but it
+# is not the merge gate: a pull request could edit it. gate.yml is the gate. Editing anything under pipelines/
+# or src/ is a platform-tier change, so a weakened copy of this file still needs a platform approver.
+#
+# Not yet run in Azure DevOps.
+trigger: none
+pr: none  # Azure Repos ignores pr triggers; the branch policy queues this pipeline
+
+pool:
+  vmImage: ubuntu-24.04
+
+steps:
+  - checkout: self
+    fetchDepth: 0  # review reads main's history to see which versions ran in qa
+
+  - template: templates/setup-uv.yml
+
+  - script: uv run pre-commit run --all-files --show-diff-on-failure
+    displayName: Lint, format, types
+
+  - script: uv run pytest
+    displayName: Unit tests
+
+  - script: uv run berth check
+    displayName: Specs valid; rendered/ and schemas up to date
+
+  - script: scripts/validate-rendered.sh
+    displayName: Kubernetes schemas and admission policies on everything rendered
+
+  - script: |
+      set -euo pipefail
+      git fetch --no-tags origin main
+      uv run berth review --base origin/main --author "$(Build.RequestedForEmail)" --markdown "$(Agent.TempDirectory)/review.md"
+      echo "##vso[task.uploadsummary]$(Agent.TempDirectory)/review.md"
+    displayName: Preview who must approve (informational; gate.yml decides)

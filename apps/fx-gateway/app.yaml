@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=../../platform/schema/app.schema.json
+# Uses the escape hatch: the spec has no field for node pools or drain time, so an override patches the
+# rendered Deployment. Every override needs platform review and states why it exists.
+name: fx-gateway
+description: FIX gateway to FX liquidity providers
+owners:
+  - kai.muller@contoso.com
+  - lena.rossi@contoso.com
+source: https://dev.azure.com/contoso/trading/_git/fx-gateway
+
+services:
+  fix:
+    port: 9878
+    size: m
+    replicas: 1
+
+overrides:
+  - target: {kind: Deployment, name: fx-gateway-fix}
+    reason: FIX sessions need the static-egress node pool and two minutes to log out cleanly
+    patch:
+      spec:
+        template:
+          spec:
+            terminationGracePeriodSeconds: 120
+            nodeSelector: {agentpool: fxegress}
+            tolerations:
+              - {key: dedicated, operator: Equal, value: fxegress, effect: NoSchedule}
+
+config:
+  FIX_SENDER_COMP_ID: CONTOSO
+secrets: [fix-password]

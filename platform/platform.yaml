@@ -1,0 +1,68 @@
+# Platform settings, owned by the platform team. Every change here needs platform review:
+# review.yaml has no rule for files outside apps/, and unmatched changes need the platform team.
+registry: contosoacr.azurecr.io
+tenant_id: 00000000-0000-0000-0000-000000000000
+
+# Identity the release pipeline uses when it opens version-bump pull requests. It may change versions only.
+release_bot: berth-release@contoso.com
+
+# Individuals, not a team. Any one of them (other than the author) satisfies a platform-tier review.
+platform_approvers:
+  - infra.lead@contoso.com
+  - platform.oncall@contoso.com
+
+max_replicas_without_review: 10
+storage_class: managed-csi
+
+environments:
+  dev:
+    cluster: aks-qa
+    key_vault: kv-contoso-dev
+    default_replicas: 1
+    ingress_class: webapprouting.kubernetes.azure.com
+    ingress_namespace: app-routing-system
+    public_domain: dev.contoso.com
+    airflow: {namespace: airflow-dev, service_account: airflow-worker}
+    controlm: {server: ctm-nonprod, connection_profile: K8S_DEV, timezone: America/New_York, agent_namespace: controlm, agent_service_account: controlm-agent}
+  qa:
+    cluster: aks-qa
+    key_vault: kv-contoso-qa
+    promotes_from: dev
+    default_replicas: 1
+    ingress_class: webapprouting.kubernetes.azure.com
+    ingress_namespace: app-routing-system
+    public_domain: qa.contoso.com
+    airflow: {namespace: airflow-qa, service_account: airflow-worker}
+    controlm: {server: ctm-nonprod, connection_profile: K8S_QA, timezone: America/New_York, agent_namespace: controlm, agent_service_account: controlm-agent}
+  prod:
+    cluster: aks-prod
+    key_vault: kv-contoso-prod
+    production: true
+    promotes_from: qa
+    default_replicas: 2
+    ingress_class: webapprouting.kubernetes.azure.com
+    ingress_namespace: app-routing-system
+    public_domain: contoso.com
+    airflow: {namespace: airflow, service_account: airflow-worker}
+    controlm: {server: ctm-prod, connection_profile: K8S_PROD, timezone: America/New_York, agent_namespace: controlm, agent_service_account: controlm-agent}
+
+# The menu of pod sizes. Apps pick a name; the platform owns what it means. Memory limit = request; no CPU limit.
+sizes:
+  xs: {cpu: 100m, memory: 128Mi}
+  s: {cpu: 250m, memory: 512Mi}
+  m: {cpu: 500m, memory: 1Gi}
+  l: {cpu: "1", memory: 2Gi}
+  xl: {cpu: "2", memory: 4Gi, platform_review: true}
+  xxl: {cpu: "4", memory: 8Gi, platform_review: true}
+
+# Managed identities provisioned by the platform team (Terraform/Bicep), by app/env. Client IDs are not secret.
+identities:
+  ledger/dev: 11111111-1111-1111-1111-111111111111
+  ledger/qa: 22222222-2222-2222-2222-222222222222
+  ledger/prod: 33333333-3333-3333-3333-333333333333
+
+# Production changes wait during a freeze. Break-glass pull requests are exempt.
+freezes:
+  - start: 2026-12-28T00:00:00-05:00
+    end: 2027-01-04T00:00:00-05:00
+    reason: year-end close

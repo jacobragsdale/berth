@@ -1,0 +1,5 @@
+# yaml-language-server: $schema=../../platform/schema/env.schema.json
+version: 2026.11.1@sha256:4be4efdab983ef9a3ee2fe015bdcdd6b820ab6a6ba3b874dd7da6e3c1d9b6707
+services:
+  web:
+    replicas: 3
