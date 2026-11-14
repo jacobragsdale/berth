@@ -2,7 +2,7 @@
 
 Works anonymously against public registries (Docker Hub, GitHub, Quay, Microsoft): a request answered 401 carries a
 `WWW-Authenticate: Bearer` challenge naming a token service, which hands out a pull token. Written against the
-OCI distribution spec and Docker Hub's token flow; not yet run against a real registry.
+OCI distribution spec and Docker Hub's token flow, and run by hand against all four; the tests use canned replies.
 """
 
 import json

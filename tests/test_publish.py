@@ -4,6 +4,7 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
 from support import app_spec, env_spec, fleet
 
 from berth import gitio
@@ -84,3 +85,45 @@ def test_publishing_commits_onto_the_branch_without_touching_the_checkout(tmp_pa
     assert after["k8s/aks-prod/demo-prod/manifests.yaml"] == FILES["k8s/aks-prod/demo-prod/manifests.yaml"]
     assert after["k8s/aks-qa/demo-dev/manifests.yaml"] == FILES["k8s/aks-qa/demo-dev/manifests.yaml"]
     assert _git(remote, "log", "--format=%s", "rendered").splitlines() == [f"aks-prod: rendered from {'c' * 12}", f"aks-qa: rendered from {'c' * 12} (unchanged)"]
+
+
+def test_a_publish_that_loses_a_race_keeps_what_the_other_cluster_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    remote, clone = tmp_path / "remote.git", tmp_path / "clone"
+    _git(tmp_path, "init", "-q", "--bare", str(remote))
+    _git(tmp_path, "clone", "-q", str(remote), str(clone))
+    branch = Branch(clone, "origin")
+    assert publish(branch, Deployed(FLEET, "aks-qa", _old(FILES), _results(), "b" * 40)) is not None
+    push, pushes = gitio.push, []
+
+    def prod_publishes_first(root: Path, remote_name: str, commit: str, name: str) -> None:
+        """Another run's prod stage publishes between this run reading the branch and pushing to it."""
+        pushes.append(commit)
+        if len(pushes) == 1:
+            monkeypatch.setattr(gitio, "push", push)
+            assert publish(branch, Deployed(FLEET, "aks-prod", FILES, None, "d" * 40)) is not None
+            monkeypatch.setattr(gitio, "push", prod_publishes_first)
+        push(root, remote_name, commit, name)
+
+    monkeypatch.setattr(gitio, "push", prod_publishes_first)
+    assert publish(branch, Deployed(FLEET, "aks-qa", FILES, _results(), "c" * 40)) == pushes[-1]
+    assert len(pushes) == 2  # refused once, then on top of what prod published
+    after = gitio.at_ref(remote, "rendered")
+    assert after["k8s/aks-qa/demo-dev/manifests.yaml"] == FILES["k8s/aks-qa/demo-dev/manifests.yaml"]
+    assert after["k8s/aks-prod/demo-prod/manifests.yaml"] == FILES["k8s/aks-prod/demo-prod/manifests.yaml"]
+
+
+def test_a_push_refused_for_another_reason_is_not_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    remote, clone = tmp_path / "remote.git", tmp_path / "clone"
+    _git(tmp_path, "init", "-q", "--bare", str(remote))
+    _git(tmp_path, "clone", "-q", str(remote), str(clone))
+    attempts = []
+
+    def refuse(_root: Path, _remote: str, commit: str, _name: str) -> None:
+        attempts.append(commit)
+        msg = "git push failed: you may not push to rendered"
+        raise gitio.GitError(msg)
+
+    monkeypatch.setattr(gitio, "push", refuse)
+    with pytest.raises(gitio.GitError, match="may not push"):
+        publish(Branch(clone, "origin"), Deployed(FLEET, "aks-qa", FILES, _results(), "c" * 40))
+    assert len(attempts) == 1

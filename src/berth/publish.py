@@ -64,16 +64,32 @@ class Deployed:
     commit: str  # the main commit it was rendered from
 
 
+_ATTEMPTS = 5
+
+
 def publish(branch: Branch, deployed: Deployed) -> str | None:
-    """Commit the cluster's part to the branch and push it. Returns the new commit, or None if nothing changed."""
-    parent = gitio.remote_branch(branch.root, branch.remote, branch.name)
-    previous = gitio.at_ref(branch.root, parent) if parent is not None else {}
-    tree = published(deployed.fleet, deployed.cluster, deployed.files, previous, deployed.results)
-    if parent is not None and tree == previous:
-        return None
-    states = sorted({item.state for item in deployed.results.namespaces.values()}) if deployed.results is not None else []
-    message = f"{deployed.cluster}: rendered from {deployed.commit[:12]}" + (f" ({', '.join(states)})" if states else "")
-    made = gitio.commit_files(branch.root, tree, parent=parent, message=message)
-    if branch.push:
-        gitio.push(branch.root, branch.remote, made, branch.name)
-    return made
+    """Commit the cluster's part to the branch and push it. Returns the new commit, or None if nothing changed.
+
+    Two runs can publish at once, one for each cluster: the pipeline's locks are per cluster, and the branch is shared.
+    The push is never forced, so the slower one is refused; it then reads the branch again and puts its cluster's part
+    on top of what the other published."""
+    refused = 0
+    while True:
+        parent = gitio.remote_branch(branch.root, branch.remote, branch.name)
+        previous = gitio.at_ref(branch.root, parent) if parent is not None else {}
+        tree = published(deployed.fleet, deployed.cluster, deployed.files, previous, deployed.results)
+        if parent is not None and tree == previous:
+            return None
+        states = sorted({item.state for item in deployed.results.namespaces.values()}) if deployed.results is not None else []
+        message = f"{deployed.cluster}: rendered from {deployed.commit[:12]}" + (f" ({', '.join(states)})" if states else "")
+        made = gitio.commit_files(branch.root, tree, parent=parent, message=message)
+        if not branch.push:
+            return made
+        try:
+            gitio.push(branch.root, branch.remote, made, branch.name)
+        except gitio.GitError:
+            refused += 1
+            if refused == _ATTEMPTS or gitio.remote_branch(branch.root, branch.remote, branch.name) == parent:
+                raise  # the branch did not move, so the push failed for another reason, such as permissions
+        else:
+            return made
