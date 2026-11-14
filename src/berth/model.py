@@ -423,6 +423,9 @@ class Deploys(Spec):
     # A run that would delete more of the objects berth made in a cluster's app namespaces deletes none of them, and
     # deploys nothing: a renderer bug that drops one kind for every app looks exactly like this.
     prune_limit: Limit = Limit(share=0.05, floor=20)
+    # On a cluster with a production environment, the deploy pipeline waits for a person when a run would change the
+    # platform, or more of production's app environments than this at once. An ordinary promotion changes one.
+    production_limit: Limit = Limit(share=0.1, floor=5)
 
 
 class Platform(Spec):

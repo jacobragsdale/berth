@@ -46,6 +46,8 @@ class Deploy:
     jobs: int
     results_out: Path | None
     hold_from: tuple[Path, ...]
+    plan: bool = False
+    plan_out: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +119,8 @@ def add_commands(sub: "argparse._SubParsersAction[argparse.ArgumentParser]") -> 
     deploy.add_argument("--jobs", type=int, default=operate.JOBS, help=f"namespaces to deploy at once (default {operate.JOBS})")
     deploy.add_argument("--results-out", type=Path, help="write what happened to each namespace here, as JSON")
     deploy.add_argument("--hold-from", type=Path, action="append", default=[], help="results of an earlier cluster's deploy in this run (repeatable)")
+    deploy.add_argument("--plan", action="store_true", help="say what the deploy would do, and whether a person should approve it, without changing the cluster")
+    deploy.add_argument("--plan-out", type=Path, help="with --plan: write the plan here, as JSON")
     check = sub.add_parser("drift", help="report where clusters differ from git")
     check.add_argument("--cluster", action="append", required=True, help="repeatable")
     _connection_args(check)
@@ -144,6 +148,10 @@ def parse(ns: argparse.Namespace, root: Path, error: Callable[[str], object]) ->
         case "deploy":
             if ns.env is not None and ns.app is None:
                 error("--env needs --app")
+            if ns.plan_out is not None and not ns.plan:
+                error("--plan-out needs --plan")
+            if ns.plan and ns.results_out is not None:
+                error("--results-out records a deploy; with --plan, use --plan-out")
             connection = Connection(ns.cluster, ns.context, ns.kubeconfig)
             return Deploy(
                 root,
@@ -160,6 +168,8 @@ def parse(ns: argparse.Namespace, root: Path, error: Callable[[str], object]) ->
                 ns.jobs,
                 ns.results_out,
                 tuple(ns.hold_from),
+                plan=ns.plan,
+                plan_out=ns.plan_out,
             )
         case "drift":
             if ns.context is not None and len(ns.cluster) > 1:
@@ -211,12 +221,19 @@ def _deploy(cmd: Deploy, checked: Checked, out: TextIO, now: datetime) -> int:
         include_break_glass=cmd.include_break_glass,
         software=cmd.software,
         jobs=cmd.jobs,
+        plan=cmd.plan,
         holds=operate.hold_from(item for item in earlier if item is not None),
         newer=newer,
     )
     tools = Tools()
     with ApiServer.connect(tools, cmd.connection.context or cluster, cmd.connection.kubeconfig) as api:
-        results = operate.deploy(operate.Site(fleet, files, api, tools, cluster), options, out)
+        site = operate.Site(fleet, files, api, tools, cluster)
+        if cmd.plan:
+            planned = operate.plan(site, options, out)
+            if cmd.plan_out is not None:
+                cmd.plan_out.write_text(planned.model_dump_json(indent=2) + "\n")
+            return 1 if planned.brake else 0
+        results = operate.deploy(site, options, out)
     if cmd.results_out is not None:
         cmd.results_out.write_text(results.model_dump_json(indent=2) + "\n")
     return results.exit_code

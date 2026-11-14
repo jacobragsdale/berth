@@ -23,7 +23,7 @@ from berth import gitio
 from berth.cli import parse, run
 from berth.fleet import load
 from berth.kube import helm_template
-from berth.operate import Results, State
+from berth.operate import Plan, Results, State
 from berth.render.software import releases, template_args, values
 
 pytestmark = pytest.mark.integration
@@ -107,6 +107,31 @@ def test_a_deploy_with_nothing_changed_touches_no_app_namespace(cluster: Cluster
     assert code == 0, out
     assert "14 unchanged" in out
     assert "applied" not in out.replace("platform: applied", "")
+
+
+def test_a_plan_says_what_a_deploy_would_do_and_changes_nothing(cluster: Cluster, tmp_path: Path) -> None:
+    env_file = cluster.repo / "apps/ledger/qa.yaml"
+    original = env_file.read_text()
+    code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--plan", "--no-software")
+    assert code == 0, out
+    assert "platform: unchanged" in out  # a dry run of every platform object matches what runs
+    assert "14 unchanged" in out
+    try:
+        env_file.write_text(original + "config:\n  LOG_LEVEL: warn\n")
+        cluster.commit("ledger qa logs warnings")
+        stamp = cluster.kubectl("get", "namespace", "ledger-qa", "-o", "jsonpath={.metadata.annotations.berth\\.contoso\\.io/deployed-digest}").stdout
+        plan_file = tmp_path / "plan.json"
+        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--plan", "--no-software", "--plan-out", str(plan_file))
+        assert code == 0, out
+        assert "ledger-qa: would deploy" in out
+        assert "1 would deploy, 13 unchanged" in out
+        assert "approval: not needed" in out  # this cluster runs no production environment
+        planned = Plan.model_validate_json(plan_file.read_text())
+        assert planned.namespaces["ledger-qa"].state is State.DEPLOYED
+        assert cluster.kubectl("get", "namespace", "ledger-qa", "-o", "jsonpath={.metadata.annotations.berth\\.contoso\\.io/deployed-digest}").stdout == stamp
+    finally:
+        env_file.write_text(original)
+        cluster.commit("restore")
 
 
 def test_a_variable_added_by_hand_is_reported_and_removed_by_revert(cluster: Cluster) -> None:

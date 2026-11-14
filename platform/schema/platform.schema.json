@@ -93,6 +93,13 @@
             "share": 0.05,
             "floor": 20
           }
+        },
+        "production_limit": {
+          "$ref": "#/$defs/Limit",
+          "default": {
+            "share": 0.1,
+            "floor": 5
+          }
         }
       },
       "title": "Deploys",

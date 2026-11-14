@@ -10,6 +10,9 @@
 # lockBehavior runLatest lets a newer run replace a queued older one rather than wait behind it. berth deploy also
 # refuses to apply over a namespace that a newer commit was deployed to.
 #
+# Before each cluster's deploy, a plan job decides what it would do. On the prod cluster, a run that changes the
+# platform, or many production apps at once, waits for a platform approver (ManualValidation); app promotions do not.
+#
 # Not yet run in Azure DevOps. Needs service connections berth-aks-qa and berth-aks-prod (workload identity
 # federation, with a Kubernetes role that can apply to berth's namespaces); an exclusive lock check on the
 # environments berth-aks-qa and berth-aks-prod; and permission for the build service to push the rendered branch,
@@ -48,7 +51,57 @@ stages:
       - stage: ${{ replace(cluster, '-', '_') }}
         displayName: Deploy to ${{ cluster }}
         jobs:
+          # berth deploy --plan decides what this cluster's deploy would do, reading the cluster and changing nothing.
+          # On a cluster with a production environment, it asks for a person when the platform would change, or more
+          # than platform.yaml's deploys.production_limit of production's app environments; an ordinary promotion
+          # never asks. Not yet run in Azure DevOps.
+          - job: plan
+            displayName: Plan
+            steps:
+              - checkout: self
+                fetchDepth: 0
+              - download: current  # the earlier clusters' results, so the plan holds what the deploy will hold
+              - template: templates/setup-uv.yml
+              - script: scripts/fetch-tools.sh
+                displayName: Pinned kubectl and Helm
+              - task: AzureCLI@2
+                name: plan
+                displayName: berth deploy --plan
+                inputs:
+                  azureSubscription: berth-${{ cluster }}
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    set -euo pipefail
+                    az aks get-credentials --resource-group rg-${{ cluster }} --name ${{ cluster }} --context ${{ cluster }} --overwrite-existing
+                    kubelogin convert-kubeconfig -l azurecli
+                    plan="$(Agent.TempDirectory)/plan.json"
+                    args=(--cluster ${{ cluster }} --plan --plan-out "$plan")
+                    for earlier in "$(Pipeline.Workspace)"/deploy-*/results.json; do
+                      if [ -f "$earlier" ]; then args+=(--hold-from "$earlier"); fi
+                    done
+                    if [ "${{ parameters.noPrune }}" = "True" ]; then args+=(--no-prune); fi
+                    if [ "${{ parameters.pruneAll }}" = "True" ]; then args+=(--prune-all); fi
+                    uv run berth deploy "${args[@]}"
+                    echo "##vso[task.setvariable variable=approve;isOutput=true]$(jq -r '(.approval | length) > 0' "$plan")"
+                env:
+                  BERTH_KUBECTL: $(Build.SourcesDirectory)/.tools/bin/kubectl
+                  BERTH_HELM: $(Build.SourcesDirectory)/.tools/bin/helm
+          - job: approve
+            displayName: Wait for a person
+            dependsOn: plan
+            condition: and(succeeded(), eq(dependencies.plan.outputs['plan.approve'], 'true'))
+            pool: server
+            timeoutInMinutes: 1440
+            steps:
+              - task: ManualValidation@1
+                inputs:
+                  approvers: platform.oncall@contoso.com,infra.lead@contoso.com
+                  instructions: This deploy to ${{ cluster }} changes the platform or many production apps at once. The plan job's log says what and why; resume to deploy, reject to stop.
+                  onTimeout: reject
           - deployment: deploy
+            dependsOn: [plan, approve]
+            condition: and(succeeded('plan'), in(dependencies.approve.result, 'Succeeded', 'Skipped'))
             environment: berth-${{ cluster }}
             strategy:
               runOnce:

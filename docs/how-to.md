@@ -378,6 +378,14 @@ Changes to `platform/`, `src/`, `pipelines/` or `scripts/` always need a platfor
 
 For a change to berth's own code, such as the renderer, the gate runs `main`'s berth, so its list of affected apps leaves the change out, and its report says so. The pull request build runs your berth, and attaches `rendered.diff` from step 2 to its run: that is the diff to review. Main's berth also reads the specs, so a pull request cannot both add a spec field to berth and use it. Merge the code first.
 
+After the merge, the deploy pipeline applies the change to the qa cluster as usual. Before the prod cluster's deploy, it runs `berth deploy --plan`, and if the platform would change there, or more production app environments than `deploys.production_limit` in `platform.yaml` at once, the run waits for a platform approver in the **Wait for a person** job. Look at qa first. To see the same plan yourself, with your own credentials for the cluster, run from a clean checkout of `main`:
+
+```sh
+uv run berth deploy --cluster aks-prod --plan
+```
+
+It reads the cluster and changes nothing. Each namespace it would deploy shows as `would deploy`, with what it would delete, and the last line says whether a person must approve.
+
 A change to `platform/review.yaml` does not affect the pull request that makes it. That pull request is judged by the table on `main`, so a new rule applies only after it merges.
 
 ## How to upgrade platform software
@@ -404,7 +412,7 @@ Platform software is the cluster software in `platform/software/<name>.yaml`: Ex
 3. Read the chart's release notes for the versions you skip. The pull request pipeline attaches a diff of the rendered charts between `main` and your branch. A removed CustomResourceDefinition deletes every object of that kind, so stop and ask if the diff shows one.
 4. After the merge and a quiet day on qa, set the shared `version` to the new one and remove the qa install's override, in a second pull request.
 
-The deploy pipeline renders each chart with `helm template` and applies it, before the platform objects and the apps. It renders a chart again only when its version, values or the cluster's Kubernetes version change.
+The deploy pipeline renders each chart with `helm template` and applies it, before the platform objects and the apps. It renders a chart again only when its version, values or the cluster's Kubernetes version change. A chart change on the prod cluster always waits for a platform approver before it deploys there.
 
 ## How to set up a cluster
 
@@ -452,18 +460,19 @@ These have not been run against a real organisation. Treat each step as a checkl
 1. Create service connections `berth-aks-qa` and `berth-aks-prod` with workload identity federation, each for an identity that is cluster-admin on its cluster. Deploys apply CRDs, ClusterRoles and admission policies, which need it. The drift pipeline uses the same connections, because its diffs are server-side dry runs and Kubernetes cannot grant "dry run only"; `berth drift` never writes.
 2. Give the project's Build Service identity **Contribute** and **Create branch** on the repository, for the `rendered` branch, which `berth publish` creates on the first deploy and adds a commit to after each one. Add a branch policy, or branch permissions, so that nobody else can push to `rendered`.
 3. Create the pipeline `berth-deploy` from `pipelines/main.yml`, and Azure Pipelines environments `berth-aks-qa`, `berth-aks-prod`, `berth-controlm-dev`, `berth-controlm-qa` and `berth-controlm-prod`. On `berth-aks-qa` and `berth-aks-prod`, add the **Exclusive lock** check: with the pipeline's `lockBehavior: runLatest`, a newer run then replaces a queued older one, and two deploys never run at once. Add business-hours checks on the prod environments if you want them.
-4. Create variable groups `berth-controlm-dev`, `berth-controlm-qa` and `berth-controlm-prod`, each holding `CTM_ENDPOINT` and a `CTM_TOKEN` issued by the Control-M team. Airflow needs nothing here: point each environment's Git DAG bundle at the `rendered` branch, subdirectory `airflow/<env>/`, with Airflow's own git connection.
-5. If you add a cluster or an environment, add it to `pipelines/templates/targets.yml` too. `berth check` fails until the two agree.
-6. Deploys delete what git no longer renders. If a run stops at the prune brake, read the kinds it names. When the change really drops them, run the pipeline again with **Delete past the prune brake** ticked; to deploy everything else first, tick **Keep objects git no longer renders** instead.
-7. Create a variable group `berth-drift`, linked to Key Vault, holding `SLACK_WEBHOOK_URL`: an incoming webhook for the channel that should get the report.
-8. Create the pipeline `berth-drift` from `pipelines/drift.yml`. It runs at 13:00 UTC every day.
-9. For the rightsizing bot:
+4. In `pipelines/main.yml`, set the **Wait for a person** job's `approvers` to the platform approvers, as Azure DevOps knows them. A run that would change the prod cluster's platform, or more than `deploys.production_limit` of its app environments, waits up to a day for one of them, then stops.
+5. Create variable groups `berth-controlm-dev`, `berth-controlm-qa` and `berth-controlm-prod`, each holding `CTM_ENDPOINT` and a `CTM_TOKEN` issued by the Control-M team. Airflow needs nothing here: point each environment's Git DAG bundle at the `rendered` branch, subdirectory `airflow/<env>/`, with Airflow's own git connection.
+6. If you add a cluster or an environment, add it to `pipelines/templates/targets.yml` too. `berth check` fails until the two agree.
+7. Deploys delete what git no longer renders. If a run stops at the prune brake, read the kinds it names. When the change really drops them, run the pipeline again with **Delete past the prune brake** ticked; to deploy everything else first, tick **Keep objects git no longer renders** instead.
+8. Create a variable group `berth-drift`, linked to Key Vault, holding `SLACK_WEBHOOK_URL`: an incoming webhook for the channel that should get the report.
+9. Create the pipeline `berth-drift` from `pipelines/drift.yml`. It runs at 13:00 UTC every day.
+10. For the rightsizing bot:
    1. Check the Datadog metric names in `platform.yaml`'s `rightsizing` against your account first: run `berth rightsize` for one app, as in [How to respond to a rightsizing pull request](#how-to-respond-to-a-rightsizing-pull-request), and compare its numbers with Datadog's own graphs. With wrong names it proposes nothing; with names that measure something else it proposes wrong sizes, which merge by themselves in dev and qa.
    2. Create a variable group `berth-datadog`, linked to Key Vault, holding `DD_API_KEY`, `DD_APP_KEY` and `DD_SITE`.
    3. Create an Azure Resource Manager service connection `berth-rightsizing`, with workload identity federation, for the bot's own identity. Give that identity **Contribute**, **Force push**, **Create branch** and **Contribute to pull requests** on the repository, and set `rightsizing_bot` in `platform.yaml` to its unique name, as it appears in a pull request's `createdBy.uniqueName`. The pipeline signs in as it and passes its token to `berth pr`, so its pull requests are the bot's, never the build service's.
    4. Create the pipeline `berth-rightsize` from `pipelines/rightsize.yml`. It runs every Monday at 12:00 UTC.
-10. For the mirror bot, use the release bot's connection `berth-release`, which the app release template also uses. Create it as in step 9.3 for the release bot's identity, `release_bot` in `platform.yaml`, and also give that identity `AcrPush` on the registry. Then create the pipeline `berth-mirror` from `pipelines/mirror.yml`, which runs every day at 06:00 UTC. Public upstream registries need no credentials.
-11. Grant each variable group pipeline permission to the pipeline that uses it only.
+11. For the mirror bot, use the release bot's connection `berth-release`, which the app release template also uses. Create it as in step 10.3 for the release bot's identity, `release_bot` in `platform.yaml`, and also give that identity `AcrPush` on the registry. Then create the pipeline `berth-mirror` from `pipelines/mirror.yml`, which runs every day at 06:00 UTC. Public upstream registries need no credentials.
+12. Grant each variable group pipeline permission to the pipeline that uses it only.
 
 ## How to set up the gate in Azure DevOps
 

@@ -28,7 +28,7 @@ from berth.drift import (
 )
 from berth.kube import ManagedFields, ObjectRef, rollout_state
 from berth.model import Limit
-from berth.operate import DeployOptions, Outcome, Results, Seen, State, Target, decide
+from berth.operate import DeployOptions, Outcome, Plan, Results, Seen, State, Target, approval, decide
 
 NOW = datetime(2026, 11, 9, 14, tzinfo=UTC)
 BERTH = {"app.kubernetes.io/managed-by": "berth"}
@@ -263,6 +263,26 @@ def test_break_glass_and_newer_commits_are_skipped() -> None:
     newer = replace(OPTIONS, newer=lambda commit: commit == "d" * 40)
     assert _decided(_target("dev"), _seen("dev", commit="d" * 40), options=newer) is State.SKIPPED
     assert _decided(_target("dev"), _seen("dev", commit="e" * 40), options=newer) is None
+
+
+def _prod_plan(changing: int, of: int, platform: tuple[str, ...] = ()) -> tuple[Plan, list[Target]]:
+    every = [replace(_target("prod"), app=f"app{i}", namespace=f"app{i}-prod") for i in range(of)]
+    states = [State.DEPLOYED] * changing + [State.UNCHANGED] * (of - changing)
+    namespaces = {target.namespace: Outcome(app=target.app, env="prod", state=state) for target, state in zip(every, states, strict=True)}
+    return Plan(cluster="aks-prod", commit="c" * 40, platform=list(platform), namespaces=namespaces), every
+
+
+@pytest.mark.parametrize(("changing", "of", "asks"), [(1, 400, False), (40, 400, False), (41, 400, True), (5, 6, False), (6, 6, True)])
+def test_prod_waits_for_a_person_when_many_app_environments_change_at_once(changing: int, of: int, asks: bool) -> None:  # noqa: FBT001 - parametrized expectation
+    planned, every = _prod_plan(changing, of)
+    assert bool(approval(planned, FLEET, every)) is asks
+
+
+def test_prod_waits_for_a_person_when_the_platform_would_change_but_qa_never_does() -> None:
+    planned, every = _prod_plan(1, 400, platform=("ClusterRole/berth-break-glass",))
+    assert approval(planned, FLEET, every) == ["the platform would change on aks-prod: ClusterRole/berth-break-glass"]
+    on_qa = planned.model_copy(update={"cluster": "aks-qa"})
+    assert approval(on_qa, FLEET, every) == []  # aks-qa runs no production environment
 
 
 @pytest.mark.parametrize(

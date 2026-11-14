@@ -38,6 +38,7 @@ NOT_BERTH = ",".join(f"{key}!={value}" for key, value in MANAGED.items())
 ROLLOUT_SECONDS = 600
 JOBS = 8
 _SHORT = 12
+_SHOWN = 10  # platform changes named in an approval reason
 
 
 class State(StrEnum):
@@ -62,6 +63,19 @@ class Outcome(_Model):
     state: State
     detail: str = ""
     break_glass: bool = False  # skipped because someone broke glass there, so it may not run what git renders
+
+
+class Plan(_Model):
+    """What a deploy would do on one cluster, decided without changing it. A `deployed` outcome means "would deploy",
+    assuming every namespace before it deploys. `approval` says why a person should look before the deploy runs."""
+
+    cluster: str
+    commit: str
+    platform: list[str] = Field(default_factory=list)  # what the platform step would change
+    namespaces: dict[str, Outcome] = Field(default_factory=dict)
+    deletions: dict[str, list[str]] = Field(default_factory=dict)  # Kind/name by namespace
+    brake: list[str] = Field(default_factory=list)  # the prune brake, if this run would stop at it
+    approval: list[str] = Field(default_factory=list)
 
 
 class Results(_Model):
@@ -139,6 +153,7 @@ class DeployOptions:
     include_break_glass: bool = False
     software: bool = True
     jobs: int = JOBS
+    plan: bool = False  # decide and say what a deploy would do, without changing the cluster
     holds: Mapping[tuple[str, str], Outcome] = field(default_factory=dict)  # outcomes from earlier clusters in this run
     newer: Callable[[str], bool] = _never  # whether a commit deployed on the cluster descends from this one
 
@@ -460,6 +475,92 @@ def _stop_retired(site: Site, retired: list[str], seen: Seen, options: DeployOpt
             log.write([f"{name}: on the cluster but no longer in git; kept {len(gone)} objects berth made there (--no-prune), so its workloads keep running"])
 
 
+def _brake(site: Site, seen: Seen, planned: Mapping[str, list[ObjectRef]], options: DeployOptions) -> list[str]:
+    if not options.prune or options.prune_all:
+        return []
+    whole = sum(len(items) for name, items in seen.managed.items() if name in seen.namespaces)
+    return drift.prune_brake(planned, whole, site.fleet.platform.deploys.prune_limit)
+
+
+def _would_change(site: Site, doc: Mapping[str, object]) -> bool:
+    """Whether applying a platform object would change it: a server-side dry run of git's version, against the live one."""
+    applied = site.api.apply(doc, force=True, dry_run=True)
+    if applied.stored is None:
+        return True  # it would not apply as it is, which is a change worth a look too
+    meta = doc.get("metadata")
+    namespace = meta.get("namespace") if isinstance(meta, Mapping) else None
+    live = site.api.get(site.api.resource(str(doc.get("apiVersion")), str(doc.get("kind"))), drift.object_name(doc), str(namespace) if namespace is not None else None)
+    return bool(drift.object_diff("", live, applied.stored))
+
+
+def _platform_changes(site: Site, options: DeployOptions) -> list[str]:
+    """What the platform step would change: charts whose digest differs, and platform objects a dry run would change."""
+    changes: list[str] = []
+    charts = releases(site.fleet.software, site.cluster) if options.software else []
+    if charts:
+        kube_version = site.api.server_version()
+        namespaces = {item.name: item for item in site.api.list(site.api.resource("v1", "Namespace"))}
+        for release in charts:
+            live = namespaces.get(release.install.namespace)
+            if options.reapply or live is None or live.annotations.get(_chart_key(release)) != _chart_digest(release, site, kube_version):
+                changes.append(f"{release.name} ({release.spec.chart} {release.version})")
+    for part in ("namespaces", "platform", "admission"):
+        changes += [f"{doc.get('kind')}/{drift.object_name(doc)}" for doc in site.docs(f"k8s/{site.cluster}/_platform/{part}.yaml") if _would_change(site, doc)]
+    return changes
+
+
+def approval(plan: Plan, fleet: Fleet, every: Iterable[Target]) -> list[str]:
+    """Why a person should approve a deploy before it runs, or nothing. Only a cluster with a production environment
+    asks: when the platform would change there, or more of production's app environments than the limit at once."""
+    production = {env for env in fleet.platform.envs_on(plan.cluster) if fleet.platform.environments[env].production}
+    if not production:
+        return []
+    reasons: list[str] = []
+    if plan.platform:
+        shown = ", ".join(plan.platform[:_SHOWN]) + (f" and {len(plan.platform) - _SHOWN} more" if len(plan.platform) > _SHOWN else "")
+        reasons.append(f"the platform would change on {plan.cluster}: {shown}")
+    whole = sum(target.env in production for target in every)
+    changing = sum(item.env in production and item.state is State.DEPLOYED for item in plan.namespaces.values())
+    limit = fleet.platform.deploys.production_limit
+    if limit.exceeded(changing, whole):
+        reasons.append(f"{changing} of {whole} production app environments would change at once, more than deploys.production_limit allows ({limit.floor}, or {limit.share:.0%})")
+    return reasons
+
+
+def plan(site: Site, options: DeployOptions, out: TextIO) -> Plan:
+    """Decide what a deploy would do, and say so, reading the cluster but changing nothing."""
+    log = _Log(out)
+    every = targets(site.fleet, site.cluster, site.files)
+    chosen = [t for t in every if options.app in (None, t.app) and options.env in (None, t.env)]
+    seen = site.look()
+    retired = _retired(every, seen, options)
+    planned = _would_prune(site, chosen, retired, seen, options) if options.prune else {}
+    platform = _platform_changes(site, options) if options.app is None else []
+    log.write([f"plan for {site.cluster} at {options.commit[:_SHORT]}:"])
+    if options.app is None:
+        log.write([f"platform: would change {', '.join(platform)}" if platform else "platform: unchanged"])
+    outcomes: dict[tuple[str, str], Outcome] = dict(options.holds)
+    results: dict[str, Outcome] = {}
+    for env in site.fleet.platform.promotion_order():
+        for target in (t for t in chosen if t.env == env):
+            decided = decide(target, seen, outcomes, site.fleet, options) or Outcome(app=target.app, env=target.env, state=State.DEPLOYED, detail="would deploy")
+            results[target.namespace] = outcomes[(target.app, target.env)] = decided
+    deletions = {name: [f"{item.kind}/{item.name}" for item in items] for name, items in planned.items() if name in retired or results[name].state is State.DEPLOYED}
+    for name, outcome in sorted(results.items()):
+        if outcome.state is not State.UNCHANGED:
+            log.write([f"{name}: {outcome.detail}" if outcome.state is State.DEPLOYED else f"{name}: {outcome.state}: {outcome.detail}"])
+        log.write(f"  would delete {item}" for item in deletions.get(name, []))
+    log.write(f"{name}: on the cluster but no longer in git; would delete {len(deletions.get(name, []))} objects berth made there" for name in retired)
+    brake = _brake(site, seen, planned, options)
+    log.write(brake)
+    counts = {state: sum(item.state is state for item in results.values()) for state in State}
+    log.write([", ".join(f"{count} {'would deploy' if state is State.DEPLOYED else state}" for state, count in counts.items() if count) or "no app environments on this cluster"])
+    made = Plan(cluster=site.cluster, commit=options.commit, platform=platform, namespaces=dict(sorted(results.items())), deletions=deletions, brake=brake)
+    made = made.model_copy(update={"approval": approval(made, site.fleet, every)})
+    log.write([f"approval needed: {'; '.join(made.approval)}" if made.approval else "approval: not needed"])
+    return made
+
+
 def deploy(site: Site, options: DeployOptions, out: TextIO) -> Results:
     """Apply what differs, environment by environment. One app failing does not stop the others."""
     log = _Log(out)
@@ -468,8 +569,7 @@ def deploy(site: Site, options: DeployOptions, out: TextIO) -> Results:
     seen = site.look()
     retired = _retired(every, seen, options)
     if options.prune and not options.prune_all:
-        whole = sum(len(items) for name, items in seen.managed.items() if name in seen.namespaces)
-        brake = drift.prune_brake(_would_prune(site, chosen, retired, seen, options), whole, site.fleet.platform.deploys.prune_limit)
+        brake = _brake(site, seen, _would_prune(site, chosen, retired, seen, options), options)
         if brake:
             log.write(brake)
             return Results(cluster=site.cluster, commit=options.commit, platform="failed")
