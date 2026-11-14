@@ -24,7 +24,9 @@ BREAK_GLASS = "berth-break-glass"  # the ConfigMap in an app namespace that mark
 BREAK_GLASS_MANAGER = "berth-break-glass"
 # Field managers whose changes are expected: berth itself, and Kubernetes' controllers (an autoscaler setting replicas,
 # a Deployment's revision annotation). Anyone else, such as kubectl-edit, kubectl-set or kubectl-scale, is a person.
-EXPECTED_MANAGERS = frozenset({FIELD_MANAGER, STAMP_MANAGER, BREAK_GLASS_MANAGER, "kube-controller-manager"})
+HANDOVER_MANAGER = "berth-handover"  # holds a Deployment's replica count while git hands it to an autoscaler
+_CONTROLLERS = "kube-controller-manager"
+EXPECTED_MANAGERS = frozenset({FIELD_MANAGER, STAMP_MANAGER, BREAK_GLASS_MANAGER, HANDOVER_MANAGER, _CONTROLLERS})
 # A restart from kubectl only stamps the pod template; it changes nothing git describes.
 _HARMLESS = frozenset({".spec.template.metadata.annotations.kubectl.kubernetes.io/restartedAt"})
 # Kinds a strategic merge patch can edit. Custom resources only take JSON merge patches, which cannot remove list items.
@@ -316,6 +318,38 @@ def hand_changes(ref: ObjectRef) -> list[str]:
     """`manager: path` for every field a person set that git does not also set."""
     ours = _berths(ref)
     return [f"{manager}: {path}" for manager, fields in _people(ref) for path in field_paths(fields) if path not in _HARMLESS and not path.startswith(".metadata.managedFields") and path not in ours]
+
+
+def _spec(obj: Mapping[str, object]) -> Mapping[str, object]:
+    spec = obj.get("spec")
+    return {str(key): value for key, value in spec.items()} if isinstance(spec, Mapping) else {}
+
+
+def _replica_owners(ref: ObjectRef) -> set[str]:
+    """The field managers that own a Deployment's `.spec.replicas`."""
+    return {entry.manager for entry in ref.managed_fields if isinstance(spec := entry.fields.get("f:spec"), Mapping) and "f:replicas" in spec}
+
+
+def replicas_to_hold(doc: Mapping[str, object], live: ObjectRef | None) -> int | None:
+    """The replica count to keep under HANDOVER_MANAGER before applying a Deployment that starts autoscaling.
+
+    Git stops setting the count when a service gets an autoscaler. A field its only applier lets go of returns to its
+    default, so the Deployment would drop to one pod until the autoscaler acted. Held by a second applier, the count
+    stays where it is and the autoscaler takes it from there. None when git never set the count, or still does.
+    """
+    if live is None or doc.get("kind") != "Deployment" or "replicas" in _spec(doc) or FIELD_MANAGER not in _replica_owners(live):
+        return None
+    count = _spec(live.body).get("replicas")
+    return count if isinstance(count, int) else None
+
+
+def reclaims_replicas(doc: Mapping[str, object], live: ObjectRef | None) -> bool:
+    """Whether applying a Deployment takes its replica count back from an autoscaler, because the service stopped
+    autoscaling. That is no change made by hand, so the apply may override it rather than stop with a conflict. Not
+    when a person changed something else in the object: then the conflict is worth seeing."""
+    if live is None or doc.get("kind") != "Deployment" or "replicas" not in _spec(doc):
+        return False
+    return bool(_replica_owners(live) & {HANDOVER_MANAGER, _CONTROLLERS}) and not hand_changes(live)
 
 
 def removal_patch(ref: ObjectRef) -> dict[str, object] | None:

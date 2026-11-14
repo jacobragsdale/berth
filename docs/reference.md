@@ -269,9 +269,11 @@ berth talks to the API server through `kubectl proxy`, on a Unix socket in a dir
 | `deployed` | Every object applied and, unless `--no-wait`, every Deployment finished rolling out within 600 seconds. |
 | `failed` | An object did not apply (a conflict with a change made by hand names the field), or a rollout did not finish. The namespace is not stamped, so the next deploy tries again. |
 
+A Deployment's replica count changes hands when its service starts or stops autoscaling, and a deploy moves it without moving a pod. When a service gets `autoscale`, git stops setting the count; berth first holds the live count as field manager `berth-handover`, because a field its only applier lets go of returns to its default of one pod. The autoscaler takes the count from there. When a service goes back to `replicas`, berth applies that Deployment over the autoscaler's count, which is no change made by hand, and deletes the HorizontalPodAutoscaler git dropped without waiting for `--prune`: left behind, it would go on overriding the count git now sets. If a person also changed the Deployment, the apply stops with the usual conflict instead.
+
 After applying a namespace it:
 
-- reports fields set by another field manager, other than `berth`, `berth-deploy`, `berth-break-glass` and `kube-controller-manager`, ignoring status, `kubectl.kubernetes.io/restartedAt`, and fields berth also sets (a change adopted into git); with `--revert`, removes them with a strategic merge patch (built-in kinds only);
+- reports fields set by another field manager, other than `berth`, `berth-deploy`, `berth-break-glass`, `berth-handover` and `kube-controller-manager`, ignoring status, `kubectl.kubernetes.io/restartedAt`, and fields berth also sets (a change adopted into git); with `--revert`, removes them with a strategic merge patch (built-in kinds only);
 - lists objects labelled as berth's that git no longer renders; with `--prune`, deletes them, except Namespaces, PersistentVolumeClaims, versioned ConfigMaps and anything annotated `berth.contoso.io/keep: "true"`;
 - once deployed, stamps the namespace with `berth.contoso.io/deployed-digest`, `deployed-commit` and `deployed-at`, as field manager `berth-deploy`.
 

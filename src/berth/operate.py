@@ -321,9 +321,41 @@ def _not_ready(site: Site, ns: str, docs: list[dict[str, object]]) -> list[str]:
     return [f"{ns}: {name} did not become ready: {why}" for name, why in waits if why is not None]
 
 
+_AUTOSCALER = "HorizontalPodAutoscaler"  # rendered with the name of the Deployment it scales
+
+
+def _hand_over_replicas(site: Site, ns: str, docs: list[dict[str, object]], live: list[ObjectRef]) -> tuple[set[str], list[str]]:
+    """Pass each Deployment's replica count between git and its autoscaler before git's version is applied, so that
+    neither change of hands moves a pod. Returns the Deployments whose count git takes back, and what was done."""
+    deployments = {item.name: item for item in live if item.kind == "Deployment"}
+    dropped = {item.name: item for item in drift.prune_plan(docs, live) if item.kind == _AUTOSCALER}
+    reclaimed: set[str] = set()
+    lines: list[str] = []
+    for doc in docs:
+        name = drift.object_name(doc)
+        current = deployments.get(name) if doc.get("kind") == "Deployment" else None
+        count = drift.replicas_to_hold(doc, current)
+        if count is not None:
+            hold = {"apiVersion": doc.get("apiVersion"), "kind": "Deployment", "metadata": {"name": name, "namespace": ns}, "spec": {"replicas": count}}
+            held = site.api.apply(hold, manager=drift.HANDOVER_MANAGER, force=True)
+            if not held.ok:
+                msg = f"Deployment/{name}: could not hold its replica count for the autoscaler: {held.error}"
+                raise KubeError(msg)
+            lines.append(f"{ns}: Deployment/{name} keeps {count} replicas until its autoscaler takes over")
+        elif drift.reclaims_replicas(doc, current):
+            reclaimed.add(name)
+            if name in dropped:
+                # Not left for --prune: an autoscaler git dropped would go on overriding the count git now sets.
+                site.api.delete(dropped[name])
+                lines.append(f"{ns}: deleted {_AUTOSCALER}/{name}: git sets the replica count now")
+    return reclaimed, lines
+
+
 def _apply_namespace(site: Site, target: Target, options: DeployOptions, live: list[ObjectRef]) -> tuple[State, str, list[str]]:
     ns, docs = target.namespace, site.rendered(target)
-    applied = [site.api.apply(doc, force=options.revert) for doc in docs]
+    reclaimed, handed_over = _hand_over_replicas(site, ns, docs, live)
+    applied = [site.api.apply(doc, force=options.revert or (doc.get("kind") == "Deployment" and drift.object_name(doc) in reclaimed)) for doc in docs]
+    live = [item for item in live if not (item.kind == _AUTOSCALER and item.name in reclaimed)]  # deleted above, if git dropped them
     conflicts = [(item, conflict) for item in applied for conflict in item.conflicts]
     lines: list[str] = []
     if conflicts:
@@ -332,8 +364,8 @@ def _apply_namespace(site: Site, target: Target, options: DeployOptions, live: l
         lines.append("  adopt the change in the spec, or deploy with --revert to put git back")
     lines += [f"{ns}: {item.kind}/{item.name}: {item.error}" for item in applied if item.error is not None]
     if lines:
-        return State.FAILED, "conflicts with changes made by hand" if conflicts else "apply failed", lines
-    lines = [f"{ns}: applied {len(applied)} objects", *_hand_changes(site, ns, applied, options), *_prune(site, ns, docs, live, options)]
+        return State.FAILED, "conflicts with changes made by hand" if conflicts else "apply failed", handed_over + lines
+    lines = [f"{ns}: applied {len(applied)} objects", *handed_over, *_hand_changes(site, ns, applied, options), *_prune(site, ns, docs, live, options)]
     not_ready = _not_ready(site, ns, docs) if options.wait else []
     if not_ready:
         return State.FAILED, "a rollout did not finish", lines + not_ready

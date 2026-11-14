@@ -17,7 +17,9 @@ from berth.drift import (
     missing,
     object_diff,
     prune_plan,
+    reclaims_replicas,
     removal_patch,
+    replicas_to_hold,
     slack,
     superseded,
     text,
@@ -55,6 +57,38 @@ def test_an_element_added_as_a_whole_is_one_path() -> None:
 )
 def test_only_changes_people_made_count_as_by_hand(entry: ManagedFields, expected: list[str]) -> None:
     assert hand_changes(ref("Deployment", "ledger-api", managed_fields=(entry,))) == expected
+
+
+REPLICAS: dict[str, object] = {"f:spec": {"f:replicas": {}}}
+FIXED: dict[str, object] = {"kind": "Deployment", "metadata": {"name": "ledger-api"}, "spec": {"replicas": 3}}
+AUTOSCALED: dict[str, object] = {"kind": "Deployment", "metadata": {"name": "ledger-api"}, "spec": {}}
+
+
+def _deployment(*owners: ManagedFields, replicas: int = 5) -> ObjectRef:
+    return ref("Deployment", "ledger-api", managed_fields=owners, body={"spec": {"replicas": replicas}})
+
+
+def test_a_deployment_that_starts_autoscaling_keeps_its_replicas_until_the_autoscaler_acts() -> None:
+    ours = ManagedFields("berth", "Apply", "", REPLICAS)
+    assert replicas_to_hold(AUTOSCALED, _deployment(ours)) == 5  # git lets go of the count: hold it, or it drops to one
+    assert replicas_to_hold(FIXED, _deployment(ours)) is None  # git still sets it
+    assert replicas_to_hold(AUTOSCALED, _deployment(ManagedFields("kube-controller-manager", "Update", "scale", REPLICAS))) is None  # already the autoscaler's
+    assert replicas_to_hold(AUTOSCALED, None) is None  # a new Deployment: the autoscaler starts it at its minimum
+
+
+@pytest.mark.parametrize(
+    ("owners", "expected"),
+    [
+        ((ManagedFields("kube-controller-manager", "Update", "scale", REPLICAS),), True),  # the autoscaler moved it
+        ((ManagedFields("berth-handover", "Apply", "", REPLICAS),), True),  # the autoscaler never had to
+        ((ManagedFields("berth", "Apply", "", REPLICAS),), False),  # git's already: nothing to take back
+        ((ManagedFields("kubectl", "Update", "scale", REPLICAS),), False),  # a person scaled it: that is a conflict to show
+        ((ManagedFields("kube-controller-manager", "Update", "scale", REPLICAS), ManagedFields("kubectl-set", "Update", "", SET_ENV)), False),  # and so is any other hand change
+    ],
+)
+def test_a_deployment_that_stops_autoscaling_takes_its_replicas_back_from_the_autoscaler_only(owners: tuple[ManagedFields, ...], expected: bool) -> None:  # noqa: FBT001 - a parametrized expectation
+    assert reclaims_replicas(FIXED, _deployment(*owners)) is expected
+    assert not reclaims_replicas(AUTOSCALED, _deployment(*owners))
 
 
 def test_the_removal_patch_deletes_an_added_list_item_by_its_key() -> None:

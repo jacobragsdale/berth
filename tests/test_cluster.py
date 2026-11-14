@@ -196,6 +196,49 @@ def test_a_change_adopted_into_the_spec_deploys_cleanly_and_stops_being_drift(cl
         cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "ledger", "--env", "qa", "--revert")
 
 
+def test_a_service_keeps_its_replicas_when_it_starts_autoscaling_and_git_takes_them_back_when_it_stops(cluster: Cluster) -> None:
+    env_file = cluster.repo / "apps/ledger/qa.yaml"
+    original = env_file.read_text()
+    deploy = ("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "ledger", "--env", "qa")
+
+    def replicas() -> str:
+        return cluster.kubectl("get", "deployment", "ledger-api", "-n", "ledger-qa", "-o", "jsonpath={.spec.replicas}").stdout
+
+    try:
+        env_file.write_text(original + "services:\n  api: {replicas: 5}\n")
+        cluster.commit("five ledger replicas in qa")
+        assert cluster.berth(*deploy)[0] == 0
+        assert replicas() == "5"
+
+        env_file.write_text(original + "services:\n  api: {autoscale: {min: 3, max: 8}}\n")
+        cluster.commit("autoscale ledger in qa")
+        code, out = cluster.berth(*deploy)
+        assert code == 0, out
+        assert "Deployment/ledger-api keeps 5 replicas until its autoscaler takes over" in out
+        assert replicas() == "5"  # without the handover, the count git stopped setting would fall back to 1
+        assert "ledger-qa" not in cluster.drift()
+
+        # The autoscaler scales through the scale subresource, as kube-controller-manager.
+        scale = {"apiVersion": "autoscaling/v1", "kind": "Scale", "metadata": {"name": "ledger-api", "namespace": "ledger-qa"}, "spec": {"replicas": 6}}
+        path = "/apis/apps/v1/namespaces/ledger-qa/deployments/ledger-api/scale?fieldManager=kube-controller-manager"
+        assert cluster.kubectl("replace", "--raw", path, "-f", "-", stdin=json.dumps(scale)).returncode == 0
+        assert replicas() == "6"
+        assert "ledger-qa" not in cluster.drift()
+
+        env_file.write_text(original + "services:\n  api: {replicas: 3}\n")
+        cluster.commit("three ledger replicas in qa")
+        code, out = cluster.berth(*deploy)
+        assert code == 0, out  # the autoscaler's count is not a change made by hand, so this is no conflict
+        assert "deleted HorizontalPodAutoscaler/ledger-api: git sets the replica count now" in out
+        assert replicas() == "3"
+        assert cluster.kubectl("get", "hpa", "ledger-api", "-n", "ledger-qa").returncode != 0
+        assert "ledger-qa" not in cluster.drift()
+    finally:
+        env_file.write_text(original)
+        cluster.commit("restore")
+        assert cluster.berth(*deploy)[0] == 0
+
+
 def test_an_object_made_by_hand_is_reported(cluster: Cluster) -> None:
     assert cluster.kubectl("create", "configmap", "tmp-fix", "-n", "ledger-qa", "--from-literal=a=b").returncode == 0
     assert "ledger-qa: made by hand: ConfigMap/tmp-fix; not marked" in cluster.drift()
