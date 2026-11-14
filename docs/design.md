@@ -227,7 +227,7 @@ The aim is that a reviewer never has to check shape, only intent:
 | Check | Catches | Tool |
 |---|---|---|
 | Spec schema | unknown fields, wrong types, bad names, an unparseable cron, a version without a digest | Pydantic models, also exported as JSON Schema for editors |
-| Cross-file rules | sizes not on the menu, `talks_to` a service that does not exist, two services with one hostname, a schedule Control-M cannot express, software in an app namespace, a Gateway without its certificate, an override of an object that is not rendered, pipelines that list other clusters than `platform.yaml` | `berth check` |
+| Cross-file rules | sizes not on the menu, `talks_to` a service that does not exist, two services with one hostname, a schedule Control-M cannot express, software in an app namespace, a Gateway without its certificate, an override of an object that is not rendered, a name too long for Kubernetes once berth joins it to the app's, a setting named like a variable berth sets, pipelines that list other clusters than `platform.yaml` | `berth check` |
 | Rendered effect | what the change does to every object and DAG, including a change to berth itself | `berth diff`, attached to the pull request build |
 | Kubernetes schemas | invalid objects, for the clusters' version and the next one | kubeconform |
 | Admission and deploys | what the API server refuses, including scheduler pods; drift detection; revert; prune | a real kube-apiserver, in `pytest -m integration` |

@@ -77,10 +77,28 @@ def test_loading_rejects(apps: dict[str, tuple[dict[str, object], dict[str, dict
             {"demo": (app_spec(workflows={"n": {"orchestrator": "controlm", "schedule": "*/5 * * * *", "timezone": "America/New_York", "tasks": {"t": {}}}}), {"dev": env_spec()})},
             "one fixed time a day",
         ),
+        # Names berth joins from the app's own: Kubernetes refuses a label over 63 characters and a CronJob name over 52.
+        (
+            {"a" * 40: (app_spec(name="a" * 40, workflows={"w" * 12: {"orchestrator": "kubernetes", "schedule": "0 1 * * *", "tasks": {"t": {}}}}), {"dev": env_spec()})},
+            "has 53 characters and Kubernetes allows 52",
+        ),
+        ({"a" * 40: (app_spec(name="a" * 40, workflows={"w" * 10: {"orchestrator": "airflow", "tasks": {"t" * 12: {}}}}), {"dev": env_spec()})}, "has 64 characters and Kubernetes allows 63"),
+        # A container's own variables win over its settings, so a setting must not take the name of one berth sets.
+        ({"demo": (app_spec(secrets=["db-password"], config={"DB_PASSWORD": "x"}), {"dev": env_spec()})}, "config.DB_PASSWORD: berth sets DB_PASSWORD itself"),
+        ({"demo": (app_spec(), {"dev": env_spec(config={"HTTPS_PROXY": "http://elsewhere:1"})})}, "config.HTTPS_PROXY: berth sets HTTPS_PROXY itself"),
+        (
+            {"demo": (app_spec(talks_to=["ledger/api"], config={"LEDGER_API_URL": "x"}), {"dev": env_spec()}), "ledger": (app_spec(name="ledger"), {"dev": env_spec()})},
+            "config.LEDGER_API_URL: berth sets LEDGER_API_URL itself",
+        ),
     ],
 )
 def test_fleet_checks(apps: dict[str, tuple[dict[str, object], dict[str, dict[str, object]]]], message: str) -> None:
     assert any(message in problem for problem in validate.problems(fleet(apps)))
+
+
+def test_names_at_kubernetes_limits_pass() -> None:
+    workflows = {"w" * 11: {"orchestrator": "kubernetes", "schedule": "0 1 * * *", "tasks": {"t" * 10: {}}}}  # 52 and 63 characters
+    assert validate.problems(fleet({"a" * 40: (app_spec(name="a" * 40, workflows=workflows), {"dev": env_spec()})})) == []
 
 
 def test_talks_to_another_deployed_service_is_fine() -> None:

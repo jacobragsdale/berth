@@ -112,6 +112,12 @@ def _env(ctx: Context, component: str) -> list[Doc]:
     return env
 
 
+def berth_variables(ctx: Context) -> set[str]:
+    """The names of the variables berth sets on every container. A setting of the same name would silently lose to it,
+    because a container's own `env` wins over the ConfigMap it reads settings from."""
+    return {str(item["name"]) for item in _env(ctx, "")}
+
+
 def resources(size: Size) -> Doc:
     # No CPU limit: throttling hurts latency more than a noisy neighbour does. Memory limit equals the request.
     return {"requests": {"cpu": size.cpu, "memory": size.memory}, "limits": {"memory": size.memory}}

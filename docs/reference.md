@@ -13,14 +13,14 @@ This page covers the spec files, the platform files and platform software, the r
 | `owners` | list of identities | required | At least two, no duplicates. Lower-case Azure DevOps or Entra sign-in names (`name@domain`). Groups are not accepted. Owners also get read access in Kubernetes; see [Access](#access). |
 | `source` | URL | required | `https://` URL of the repository that builds the image. Shown on the namespace. |
 | `image` | string | `name` | Repository in the platform registry. The full image is `<registry>/<image>:<version>`. |
-| `config` | map of string to string | `{}` | Environment variables for every container. Keys match `^[A-Z_][A-Z0-9_]*$`. Values must be strings, so quote numbers and booleans. |
+| `config` | map of string to string | `{}` | Environment variables for every container. Keys match `^[A-Z_][A-Z0-9_]*$`. Values must be strings, so quote numbers and booleans. A key may not be the name of a variable berth sets itself (a secret, a `talks_to` variable, the proxy, telemetry, `BERTH_*`): that one would win. |
 | `files` | map of file name to string | `{}` | Files mounted read-only at `/config/<name>`. |
 | `secrets` | list of names | `[]` | Key Vault secrets read from `<app>--<name>` and exposed as the environment variable `NAME` (upper case, `-` becomes `_`). |
 | `talks_to` | list of `app/service` | `[]` | Services this app calls. Each one injects `<APP>_<SERVICE>_HOST`, `_PORT` and `_URL`, and admits this app through the target's network policy, so a new entry also needs the target's owners (see [Review rules](#review-rules)). The target must run in every environment this app runs in, and must have a `port`. An app may not list itself. |
 | `calls` | list of `host` or `host:port` | `[]` | Systems outside the cluster the app depends on, such as a database. Recorded on the namespace as `berth.contoso.io/app-calls`; no effect on traffic. |
 | `azure_identity` | bool | `false` | Gives pods a workload identity. Needs an entry for `<app>/<env>` in `platform.yaml` `identities` for each environment. |
 | `services` | map of name to [service](#services) | `{}` | Long-running processes. Names are 1–20 characters. |
-| `workflows` | map of name to [workflow](#workflows) | `{}` | Scheduled or triggered jobs. Names must not repeat a service name. |
+| `workflows` | map of name to [workflow](#workflows) | `{}` | Scheduled or triggered jobs. Names must not repeat a service name. `<app>-<workflow>-<task>` is a Kubernetes label, so it may have at most 63 characters, and `<app>-<workflow>` at most 52 for a `kubernetes` workflow, whose CronJob it names. |
 | `overrides` | list of [overrides](#overrides) | `[]` | Patches to rendered objects, applied in every environment. |
 
 An app must have at least one service or workflow.

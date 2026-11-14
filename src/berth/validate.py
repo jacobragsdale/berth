@@ -5,9 +5,16 @@ from collections.abc import Mapping
 from berth import yamlio
 from berth.fleet import MIRRORS_FILE, SOFTWARE_DIR, Fleet, Instance
 from berth.model import Platform
+from berth.render import context
 from berth.render.controlm import controlm_when
 from berth.render.k8s import gateway_certificates
+from berth.render.pod import berth_variables, telemetry_service
 from berth.render.software import releases, values
+
+# Kubernetes' own limits on names berth builds from an app's, which no schema checks: a label value, and a CronJob's
+# name, which is shorter because each Job it starts adds a suffix.
+_LABEL_VALUE = 63
+_CRONJOB_NAME = 52
 
 
 def problems(fleet: Fleet) -> list[str]:
@@ -19,7 +26,11 @@ def problems(fleet: Fleet) -> list[str]:
         sizes = [(f"services.{name}", service.size) for name, service in instance.services.items()]
         sizes += [(f"workflows.{wf}.tasks.{task}", spec.size) for wf, workflow in instance.workflows.items() for task, spec in workflow.tasks.items()]
         found.extend(f"{where}: {path}: unknown size {size!r} (sizes: {', '.join(platform.sizes)})" for path, size in sizes if size not in platform.sizes)
-        found.extend(_reference_problems(fleet, instance, where))
+        references = _reference_problems(fleet, instance, where)
+        found.extend(references)
+        if not references:  # the variables include one set per service called, so those must exist first
+            taken = berth_variables(context(fleet, instance))
+            found.extend(f"{where}: config.{key}: berth sets {key} itself, and its value would win; rename the setting" for key in sorted(taken & set(instance.config)))
         if instance.azure_identity and f"{instance.app}/{instance.env}" not in platform.identities:
             found.append(f"{where}: azure_identity needs a managed identity for {instance.app}/{instance.env} in platform/platform.yaml (ask the platform team)")
         for name, workflow in instance.workflows.items():
@@ -32,7 +43,23 @@ def problems(fleet: Fleet) -> list[str]:
                     controlm_when(workflow.schedule)
                 except ValueError as error:
                     found.append(f"{where}: workflows.{name}: {error}")
-    return found + _hostname_problems(fleet) + _software_problems(fleet) + _mirror_problems(fleet)
+    return found + _name_problems(fleet) + _hostname_problems(fleet) + _software_problems(fleet) + _mirror_problems(fleet)
+
+
+def _name_problems(fleet: Fleet) -> list[str]:
+    """Names berth joins from an app's own must still fit Kubernetes' limits, or the API server refuses the deploy."""
+    found: list[str] = []
+    for app, source in sorted(fleet.apps.items()):
+        for name, workflow in sorted(source.spec.workflows.items()):
+            where = f"apps/{app}/app.yaml: workflows.{name}"
+            cronjob = f"{app}-{name}"
+            if workflow.orchestrator == "kubernetes" and len(cronjob) > _CRONJOB_NAME:
+                found.append(f"{where}: the CronJob name {cronjob!r} has {len(cronjob)} characters and Kubernetes allows {_CRONJOB_NAME}; shorten the workflow's name")
+            for task in sorted(workflow.tasks):
+                service = telemetry_service(app, f"{name}-{task}")
+                if len(service) > _LABEL_VALUE:
+                    found.append(f"{where}.tasks.{task}: its label {service!r} has {len(service)} characters and Kubernetes allows {_LABEL_VALUE}; shorten the workflow's or the task's name")
+    return found
 
 
 PIPELINE_TARGETS = "pipelines/templates/targets.yml"
