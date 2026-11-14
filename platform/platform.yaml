@@ -48,7 +48,8 @@ links:
   datadog-traces: https://app.datadoghq.com/apm/traces?query=service%3A{service}%20env%3A{env}
 
 # Each environment's break_glass_groups may change its app namespaces with kubectl in an emergency: workloads and
-# settings, never Secrets or a shell (the berth-break-glass role). The daily drift report shows what they changed.
+# settings, never Secrets or a shell (the berth-break-glass role). That removes standing access to secrets, not every
+# path to one: a changed command can print a secret. The daily drift report shows what they changed.
 # Production's group is managed by Entra PIM: nobody is in it until they ask, and membership ends by itself.
 environments:
   dev:

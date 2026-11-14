@@ -321,7 +321,7 @@ uv run berth breakglass payments-api --env prod --reason "pool exhausted, scalin
 kubectl --context aks-prod -n payments-api-prod scale deployment/payments-api-api --replicas=8
 ```
 
-`berth breakglass` warns if you are not in the environment's group yet. Break-glass can scale, restart and change Deployments, change ConfigMaps, Services, autoscalers, disruption budgets, network policies and routes, run and delete Jobs and CronJobs, and delete pods. It cannot read Secrets, open a shell in a container, or port-forward, because each would reveal the app's secrets. Ask the platform team if you need one of those.
+`berth breakglass` warns if you are not in the environment's group yet. Break-glass can scale, restart and change Deployments, change ConfigMaps, Services, autoscalers, disruption budgets, network policies and routes, run and delete Jobs and CronJobs, and delete pods. It cannot read Secrets, open a shell in a container, or port-forward; ask the platform team if you need one of those. The role is about leaving a trace, not about secrecy: a changed command can still print a secret to the logs, and the drift report, the changed object and PIM's log would all show that it was done.
 
 The mark is a ConfigMap named `berth-break-glass` in the app's namespace, holding your sign-in name, your reason and when it expires. Until then, deploys skip that namespace and log that they did. After it expires, deploys apply the app again when git changes it, and the drift report flags the mark as `EXPIRED`. A deploy that meets your change then stops with a conflict until someone deals with it. Before then, do one of two things:
 
@@ -451,7 +451,7 @@ This is a one-time step for whoever administers Entra ID, with the platform team
 1. For dev and qa, create an Entra security group, or reuse one that holds every developer, and put its object ID in both environments' `break_glass_groups`.
 2. For prod, create a separate security group with no members, and put its object ID in prod's `break_glass_groups`.
 3. Onboard the prod group to **Privileged Identity Management** for groups. Make every developer **eligible** for membership, not active. In the membership settings, require a justification on activation, set the maximum activation to a few hours, and decide whether activation needs approval. An approval step is slower in an incident; without one, the justification and the PIM audit log are the record.
-4. Check that AKS sees the group: activate your eligibility, sign in again (`kubelogin remove-tokens`), and run `kubectl auth whoami -o yaml` against the prod cluster. The group's object ID should be among your groups. `kubectl auth can-i patch deployments -n ledger-prod` should then say `yes`, and `kubectl auth can-i get secrets -n ledger-prod` should say `no`.
+4. Check that AKS sees the group: activate your eligibility, sign in again (`kubelogin remove-tokens`), and run `kubectl auth whoami -o yaml` against the prod cluster. The group's object ID should be among your groups. `kubectl auth can-i patch deployments -n ledger-prod` should then say `yes`, and `kubectl auth can-i get secrets -n ledger-prod` should say `no`. That `no` removes standing access, not every path to a secret: someone who has activated the group can still change a workload to print one. Treat activation, which PIM logs with its justification, as access to the app's secrets, and the drift report as the record of what was done with it.
 
 ## How to set up the deploy and drift pipelines
 

@@ -367,7 +367,8 @@ def software_namespaces(cluster: str, software: Mapping[str, Software]) -> list[
 _READ = ["get", "list", "watch"]
 _CHANGE = ["update", "patch"]
 # What an emergency needs: scale, restart, change settings, images and routes, run a job, delete a stuck pod. Not
-# Secrets and not exec, attach or port-forward: each would reveal the app's secrets. Not RBAC, so nobody can widen it.
+# Secrets and not exec, attach or port-forward, so nobody reads a secret without changing something the drift report
+# shows (a changed command can still print one). Not RBAC, so nobody can widen it.
 _BREAK_GLASS_RULES: list[Doc] = [
     {"apiGroups": [""], "resources": ["pods", "pods/log", "events", "endpoints", "persistentvolumeclaims", "serviceaccounts", "services", "configmaps"], "verbs": _READ},
     {"apiGroups": [""], "resources": ["pods"], "verbs": ["delete"]},
