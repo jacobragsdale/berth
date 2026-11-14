@@ -441,6 +441,14 @@ This is a one-time step per cluster for the platform team, after the Azure setup
    ```
 
    The first line should end `N in sync, 0 need attention`. Anything else is listed below it; see [How to resolve what the drift report shows](#how-to-resolve-what-the-drift-report-shows).
+4. If `changed by hand` lines name a manager that is not a person, such as an AKS add-on that annotates workloads, add it to `platform.yaml` and merge:
+
+   ```yaml
+   deploys:
+     field_managers: [aks-policy-addon]
+   ```
+
+   Drift, deploys and `--revert` then leave its fields alone, in every cluster. Never list a `kubectl` manager: those are people, and `berth check` refuses them.
 
 From then on, the deploy pipeline does this after every merge.
 

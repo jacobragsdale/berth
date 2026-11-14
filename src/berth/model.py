@@ -407,6 +407,10 @@ class Rightsizing(Spec):
         return self
 
 
+# A field manager as the API server records it (`?fieldManager=`, at most 128 printable characters).
+FieldManager = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")]
+
+
 class Limit(Spec):
     """A share of a whole, with a floor for small wholes: exceeded by more than `floor` items and more than `share` of the whole."""
 
@@ -426,6 +430,20 @@ class Deploys(Spec):
     # On a cluster with a production environment, the deploy pipeline waits for a person when a run would change the
     # platform, or more of production's app environments than this at once. An ordinary promotion changes one.
     production_limit: Limit = Limit(share=0.1, floor=5)
+    # Field managers that write to berth's objects and are not people, beyond berth's own and Kubernetes' controllers:
+    # an AKS add-on or an operator that sets fields of its own. Drift, deploys and --revert all leave them alone.
+    field_managers: tuple[FieldManager, ...] = ()
+
+    @model_validator(mode="after")
+    def _managers_are_not_people(self) -> Self:
+        if len(set(self.field_managers)) != len(self.field_managers):
+            msg = "field_managers lists a manager twice"
+            raise ValueError(msg)
+        for manager in self.field_managers:
+            if manager.startswith("kubectl"):
+                msg = f"field_managers: {manager!r} cannot be listed: kubectl is how people change things by hand, and the drift report exists to show those"
+                raise ValueError(msg)
+        return self
 
 
 class Platform(Spec):

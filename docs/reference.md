@@ -100,15 +100,16 @@ An app must have at least one service or workflow.
 | `sizes.<name>` | `cpu`, `memory`, and `platform_review` (default `false`). The memory limit equals `memory`; there is no CPU limit. |
 | `identities` | `<app>/<env>` to workload identity client ID. |
 | `freezes` | `start`, `end` (time zone required) and `reason`. Production changes wait while a freeze is active. |
-| `deploys` | Brakes on what one deploy may do without a person; see [Deploy brakes](#deploy-brakes). Every field has a default. |
+| `deploys` | Brakes on what one deploy may do without a person, and field managers that are not people; see [Deploys](#deploys). Every field has a default. |
 
-## Deploy brakes
+## Deploys
 
 `platform.yaml`'s `deploys` block. A limit is `{share, floor}`, and is exceeded by more than `floor` items when that is also more than `share` (0–1) of the whole.
 
 | Field | Default | Description |
 |---|---|---|
 | `production_limit` | `{share: 0.1, floor: 5}` | On a cluster with a `production` environment, `berth deploy --plan` asks for a person when the platform would change (a chart, or a platform object a dry run would change), or when more than this of production's app environments would deploy. The deploy pipeline then waits for a platform approver. An ordinary promotion changes one. |
+| `field_managers` | `[]` | Field managers whose changes are expected, besides berth's own and `kube-controller-manager`: an AKS add-on or an operator that writes fields of berth's objects. Drift does not report their fields, deploys do not list them as changed by hand, and `--revert` leaves them. Names are field managers as the API server records them; none may start with `kubectl`, and none may repeat. |
 | `prune_limit` | `{share: 0.05, floor: 20}` | A deploy that would delete more than this of the objects berth made in the cluster's app namespaces deletes nothing and applies nothing, and fails as the platform would (exit 1), listing the kinds by count. `--prune-all` goes past it; `--no-prune` deploys without deleting. |
 
 ## Rightsizing
@@ -277,7 +278,7 @@ berth talks to the API server through `kubectl proxy`, on a Unix socket in a dir
 | `held` | The environment it promotes from failed, was held, or was skipped for break-glass, for the same app in this run, on this cluster or in a `--hold-from` results file. Or that environment is on this cluster, is not part of this run (as with `--app APP --env prod`), and its namespace's `deployed-digest` is not what git renders for it. Nothing is applied; the detail says which. |
 | `skipped` | A `berth-break-glass` ConfigMap in the namespace has an expiry in the future (unless `--include-break-glass`), or the namespace's `berth.contoso.io/deployed-commit` descends from the commit being deployed. |
 
-Before applying anything, a deploy works out what it would delete: the objects git dropped from each namespace it may deploy, and what berth made in each retired environment. If that exceeds `deploys.prune_limit`, it stops there; see [Deploy brakes](#deploy-brakes).
+Before applying anything, a deploy works out what it would delete: the objects git dropped from each namespace it may deploy, and what berth made in each retired environment. If that exceeds `deploys.prune_limit`, it stops there; see [Deploys](#deploys).
 | `deployed` | Every object applied and, unless `--no-wait`, within 600 seconds for the namespace: External Secrets synced each ExternalSecret (condition `Ready=True`, with `status.syncedResourceVersion` for the generation applied), then every Deployment finished rolling out. |
 | `failed` | An object did not apply (a conflict with a change made by hand names the field), an ExternalSecret reported `Ready=False` for 20 seconds or did not sync in time (the line carries the condition's message), or a rollout did not finish. The namespace is not stamped, so the next deploy tries again. |
 
@@ -285,7 +286,7 @@ A Deployment's replica count changes hands when its service starts or stops auto
 
 After applying a namespace it:
 
-- reports fields set by another field manager, other than `berth`, `berth-deploy`, `berth-break-glass`, `berth-handover` and `kube-controller-manager`, ignoring status, `kubectl.kubernetes.io/restartedAt`, and fields berth also sets (a change adopted into git); with `--revert`, removes them with a strategic merge patch (built-in kinds only);
+- reports fields set by another field manager, other than `berth`, `berth-deploy`, `berth-break-glass`, `berth-handover`, `kube-controller-manager` and those in `deploys.field_managers`, ignoring status, `kubectl.kubernetes.io/restartedAt`, and fields berth also sets (a change adopted into git); with `--revert`, removes them with a strategic merge patch (built-in kinds only);
 - deletes objects labelled as berth's that git no longer renders, except Namespaces, PersistentVolumeClaims, versioned ConfigMaps, objects with owner references and anything annotated `berth.contoso.io/keep: "true"`; with `--no-prune`, lists them instead;
 - once deployed, stamps the namespace with `berth.contoso.io/deployed-digest`, `deployed-commit` and `deployed-at`, as field manager `berth-deploy`.
 
@@ -304,7 +305,7 @@ Then, in every namespace that runs what git renders and has no break-glass mark,
 | `not deployed: …` | the namespace's deployed digest is not what git renders: a deploy has not finished since the last change |
 | `differs from git: Kind/name` | applying git's version would change the object |
 | `missing: Kind/name` | git renders an object the cluster does not have |
-| `changed by hand: Kind/name: manager: path` | a field set by a field manager other than berth or Kubernetes' controllers |
+| `changed by hand: Kind/name: manager: path` | a field set by a field manager other than berth, Kubernetes' controllers, or one in `deploys.field_managers` |
 | `made by hand: Kind/name` | an object without berth's label, not owned by a controller, and not one Kubernetes or berth creates (`default` ServiceAccount, `kube-root-ca.crt`, `berth-break-glass`) |
 | `Kind/name (removed from git)` | an object berth made that git no longer renders (versioned ConfigMaps excepted: deploys retire those) |
 | `on the cluster but no longer in git` | a berth namespace with no environment file |

@@ -231,6 +231,11 @@ class Site:
     def rendered(self, target: Target) -> list[dict[str, object]]:
         return self.docs(target.path)
 
+    @property
+    def expected(self) -> frozenset[str]:
+        """Field managers whose changes are not a person's: berth's, Kubernetes' controllers, and the platform's own."""
+        return drift.EXPECTED_MANAGERS | frozenset(self.fleet.platform.deploys.field_managers)
+
     def look(self, *, others: bool = False) -> Seen:
         """Everything a deploy or drift check needs to know, in one list call per kind, however many namespaces."""
         namespaces = {item.name: item for item in self.api.list(self.api.resource("v1", "Namespace"), labels=SELECTOR)}
@@ -327,8 +332,8 @@ def _hand_changes(site: Site, ns: str, applied: Iterable[Applied], options: Depl
         if item.stored is None:
             continue
         stored = ref(item.stored)
-        changes = drift.hand_changes(stored)
-        patch = drift.removal_patch(stored) if options.revert and changes else None
+        changes = drift.hand_changes(stored, site.expected)
+        patch = drift.removal_patch(stored, site.expected) if options.revert and changes else None
         if patch is not None:
             site.api.patch(stored, patch)
             lines += [f"{ns}: removed {stored.kind}/{stored.name} {change}" for change in changes]
@@ -394,7 +399,7 @@ def _hand_over_replicas(site: Site, ns: str, docs: list[dict[str, object]], live
                 msg = f"Deployment/{name}: could not hold its replica count for the autoscaler: {held.error}"
                 raise KubeError(msg)
             lines.append(f"{ns}: Deployment/{name} keeps {count} replicas until its autoscaler takes over")
-        elif drift.reclaims_replicas(doc, current):
+        elif drift.reclaims_replicas(doc, current, site.expected):
             reclaimed.add(name)
             if name in dropped:
                 # Deleted before the apply, not with the rest of what git dropped after it, and even with --no-prune:
@@ -666,7 +671,7 @@ def _namespace_drift(site: Site, target: Target, namespace: ObjectRef, seen: See
         not_deployed=not_deployed,
         changed=tuple(f"{item.kind}/{item.name} (removed from git)" for item in drift.prune_plan(docs, live)),
         missing=tuple(drift.missing(docs, live)),
-        by_hand=tuple(f"{item.kind}/{item.name}: {change}" for item in live for change in drift.hand_changes(item)),
+        by_hand=tuple(f"{item.kind}/{item.name}: {change}" for item in live for change in drift.hand_changes(item, site.expected)),
         unmanaged=tuple(f"{item.kind}/{item.name}" for item in drift.unmanaged(seen.others.get(target.namespace, []))),
         break_glass=seen.marks.get(target.namespace),
         deployed_commit=commit,

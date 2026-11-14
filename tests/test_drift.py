@@ -7,6 +7,7 @@ import pytest
 from support import fleet
 
 from berth.drift import (
+    EXPECTED_MANAGERS,
     SUPERSEDED_AT,
     BreakGlass,
     NamespaceDrift,
@@ -91,6 +92,15 @@ def test_a_deployment_that_starts_autoscaling_keeps_its_replicas_until_the_autos
 def test_a_deployment_that_stops_autoscaling_takes_its_replicas_back_from_the_autoscaler_only(owners: tuple[ManagedFields, ...], expected: bool) -> None:  # noqa: FBT001 - a parametrized expectation
     assert reclaims_replicas(FIXED, _deployment(*owners)) is expected
     assert not reclaims_replicas(AUTOSCALED, _deployment(*owners))
+
+
+def test_a_manager_the_platform_expects_is_not_a_person() -> None:
+    addon = ManagedFields("aks-policy-addon", "Update", "", SET_ENV)
+    deployment = ref("Deployment", "ledger-api", managed_fields=(addon,))
+    assert hand_changes(deployment) == ["aks-policy-addon: .spec.template.spec.containers[name=main].env[name=LOG_LEVEL]"]
+    expected = frozenset({"aks-policy-addon"}) | EXPECTED_MANAGERS
+    assert hand_changes(deployment, expected) == []
+    assert removal_patch(deployment, expected) is None  # --revert leaves it alone too
 
 
 def test_the_removal_patch_deletes_an_added_list_item_by_its_key() -> None:

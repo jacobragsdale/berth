@@ -25,7 +25,8 @@ from berth.render.pod import GROUP, MANAGED
 BREAK_GLASS = "berth-break-glass"  # the ConfigMap in an app namespace that marks it as changed by hand on purpose
 BREAK_GLASS_MANAGER = "berth-break-glass"
 # Field managers whose changes are expected: berth itself, and Kubernetes' controllers (an autoscaler setting replicas,
-# a Deployment's revision annotation). Anyone else, such as kubectl-edit, kubectl-set or kubectl-scale, is a person.
+# a Deployment's revision annotation). Anyone else, such as kubectl-edit, kubectl-set or kubectl-scale, is a person,
+# unless platform.yaml's deploys.field_managers names it, as for an AKS add-on that writes fields of its own.
 HANDOVER_MANAGER = "berth-handover"  # holds a Deployment's replica count while git hands it to an autoscaler
 _CONTROLLERS = "kube-controller-manager"
 EXPECTED_MANAGERS = frozenset({FIELD_MANAGER, STAMP_MANAGER, BREAK_GLASS_MANAGER, HANDOVER_MANAGER, _CONTROLLERS})
@@ -331,14 +332,20 @@ def _berths(ref: ObjectRef) -> set[str]:
     return {path for entry in ref.managed_fields if entry.manager == FIELD_MANAGER for path in _owned(entry.fields)}
 
 
-def _people(ref: ObjectRef) -> list[tuple[str, Mapping[str, object]]]:
-    return [(entry.manager, entry.fields) for entry in ref.managed_fields if entry.subresource != "status" and entry.manager not in EXPECTED_MANAGERS]
+def _people(ref: ObjectRef, expected: frozenset[str]) -> list[tuple[str, Mapping[str, object]]]:
+    return [(entry.manager, entry.fields) for entry in ref.managed_fields if entry.subresource != "status" and entry.manager not in expected]
 
 
-def hand_changes(ref: ObjectRef) -> list[str]:
-    """`manager: path` for every field a person set that git does not also set."""
+def hand_changes(ref: ObjectRef, expected: frozenset[str] = EXPECTED_MANAGERS) -> list[str]:
+    """`manager: path` for every field a person set that git does not also set. `expected` are the managers that are
+    not people: EXPECTED_MANAGERS, and those the platform adds."""
     ours = _berths(ref)
-    return [f"{manager}: {path}" for manager, fields in _people(ref) for path in field_paths(fields) if path not in _HARMLESS and not path.startswith(".metadata.managedFields") and path not in ours]
+    return [
+        f"{manager}: {path}"
+        for manager, fields in _people(ref, expected)
+        for path in field_paths(fields)
+        if path not in _HARMLESS and not path.startswith(".metadata.managedFields") and path not in ours
+    ]
 
 
 def _spec(obj: Mapping[str, object]) -> Mapping[str, object]:
@@ -364,22 +371,22 @@ def replicas_to_hold(doc: Mapping[str, object], live: ObjectRef | None) -> int |
     return count if isinstance(count, int) else None
 
 
-def reclaims_replicas(doc: Mapping[str, object], live: ObjectRef | None) -> bool:
+def reclaims_replicas(doc: Mapping[str, object], live: ObjectRef | None, expected: frozenset[str] = EXPECTED_MANAGERS) -> bool:
     """Whether applying a Deployment takes its replica count back from an autoscaler, because the service stopped
     autoscaling. That is no change made by hand, so the apply may override it rather than stop with a conflict. Not
     when a person changed something else in the object: then the conflict is worth seeing."""
     if live is None or doc.get("kind") != "Deployment" or "replicas" not in _spec(doc):
         return False
-    return bool(_replica_owners(live) & {HANDOVER_MANAGER, _CONTROLLERS}) and not hand_changes(live)
+    return bool(_replica_owners(live) & {HANDOVER_MANAGER, _CONTROLLERS}) and not hand_changes(live, expected)
 
 
-def removal_patch(ref: ObjectRef) -> dict[str, object] | None:
+def removal_patch(ref: ObjectRef, expected: frozenset[str] = EXPECTED_MANAGERS) -> dict[str, object] | None:
     """A strategic merge patch deleting every field a person added that git does not set; None if none can be built."""
     if ref.kind not in _PATCHABLE:
         return None
     ours = _berths(ref)
     patch: dict[str, object] = {}
-    for _, fields in _people(ref):
+    for _, fields in _people(ref, expected):
         _merge(patch, _removal(_without(fields, ours)))
     return patch or None
 

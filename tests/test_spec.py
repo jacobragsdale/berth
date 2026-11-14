@@ -2,11 +2,11 @@
 
 import pytest
 from pydantic import ValidationError
-from support import app_spec, env_spec, fleet, tree
+from support import PLATFORM_TEXT, app_spec, env_spec, fleet, tree
 
-from berth import validate
+from berth import validate, yamlio
 from berth.fleet import LoadError, load
-from berth.model import App, EnvFile
+from berth.model import App, EnvFile, Platform
 
 GOOD = app_spec()
 
@@ -128,3 +128,19 @@ def test_a_service_with_a_volume_defaults_to_one_replica() -> None:
     instance = fleet({"demo": (spec, {"prod": env_spec()})}).instance("demo", "prod")
     assert instance is not None
     assert instance.services["w"].replicas == 1
+
+
+@pytest.mark.parametrize(
+    ("deploys", "message"),
+    [
+        ({"field_managers": ["kubectl-edit"]}, "kubectl is how people change things by hand"),
+        ({"field_managers": ["aks-addon", "aks-addon"]}, "lists a manager twice"),
+        ({"field_managers": ["has space"]}, "String should match pattern"),
+        ({"prune_limit": {"share": 0, "floor": 5}}, "greater than 0"),
+    ],
+)
+def test_the_deploy_brakes_and_expected_managers_are_validated(deploys: dict[str, object], message: str) -> None:
+    platform = yamlio.load(PLATFORM_TEXT, source="platform.yaml")
+    assert isinstance(platform, dict)
+    with pytest.raises(ValidationError, match=message):
+        Platform.model_validate(platform | {"deploys": deploys})

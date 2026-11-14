@@ -345,6 +345,28 @@ def test_a_jobs_only_app_whose_secret_is_missing_fails_its_deploy_with_the_opera
         assert cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")[0] == 0
 
 
+def test_a_field_manager_the_platform_expects_is_neither_drift_nor_reverted(cluster: Cluster) -> None:
+    platform = cluster.repo / "platform/platform.yaml"
+    original = platform.read_text()
+    addon = cluster.kubectl("annotate", "deployment/ledger-api", "-n", "ledger-qa", "policy.aks.io/checked=true", "--field-manager=aks-policy-addon")
+    assert addon.returncode == 0, addon.stderr
+    assert "Deployment/ledger-api: aks-policy-addon: .metadata.annotations" in cluster.drift()
+    try:
+        platform.write_text(original + "deploys:\n  field_managers: [aks-policy-addon]\n")
+        cluster.commit("expect the AKS policy add-on")
+        assert "ledger-qa" not in cluster.drift()
+        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "ledger", "--env", "qa", "--revert")
+        assert code == 0, out
+        assert "removed" not in out
+        annotations = cluster.kubectl("get", "deployment", "ledger-api", "-n", "ledger-qa", "-o", "jsonpath={.metadata.annotations}").stdout
+        assert "policy.aks.io/checked" in annotations
+    finally:
+        platform.write_text(original)
+        cluster.commit("restore")
+        assert cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "ledger", "--env", "qa", "--revert")[0] == 0
+    assert "ledger-qa" not in cluster.drift()
+
+
 def test_an_object_made_by_hand_is_reported(cluster: Cluster) -> None:
     assert cluster.kubectl("create", "configmap", "tmp-fix", "-n", "ledger-qa", "--from-literal=a=b").returncode == 0
     assert "ledger-qa: made by hand: ConfigMap/tmp-fix; not marked" in cluster.drift()
