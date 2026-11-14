@@ -26,7 +26,7 @@ from berth.drift import (
     text,
     unmanaged,
 )
-from berth.kube import ManagedFields, ObjectRef, rollout_state
+from berth.kube import ManagedFields, ObjectRef, rollout_state, sync_state
 from berth.model import Limit
 from berth.operate import DeployOptions, Outcome, Plan, Results, Seen, State, Target, approval, decide
 
@@ -358,3 +358,26 @@ def test_revert_removes_only_what_git_does_not_also_set() -> None:
     applied = ManagedFields("berth", "Apply", "", _env(("BERTH_ENV", whole)))
     patch = removal_patch(ref("Deployment", "ledger-api", managed_fields=(edited, applied)))
     assert patch == {"spec": {"template": {"spec": {"containers": [{"name": "main", "env": [{"name": "EXTRA", "$patch": "delete"}]}]}}}}
+
+
+def _external_secret(generation: int, ready: str | None, synced: str = "", message: str = "") -> dict[str, object]:
+    conditions = [] if ready is None else [{"type": "Ready", "status": ready, "reason": "SecretSyncedError" if ready == "False" else "SecretSynced", "message": message}]
+    return {"metadata": {"generation": generation}, "status": {"conditions": conditions, "syncedResourceVersion": synced}}
+
+
+@pytest.mark.parametrize(
+    ("secret", "expected"),
+    [
+        (_external_secret(3, "True", synced="3-9f8e"), True),
+        (_external_secret(3, "True", synced="2-1a2b"), None),  # synced, but the version before this one
+        (_external_secret(3, None), None),  # External Secrets has not looked at it yet
+        (_external_secret(3, "False", synced="2-1a2b", message="could not get secret data from provider"), False),
+    ],
+)
+def test_an_external_secret_is_ready_once_this_generation_synced(secret: dict[str, object], expected: bool | None) -> None:  # noqa: FBT001 - parametrized expectation
+    assert sync_state(secret, 3)[0] is expected
+
+
+def test_a_failed_sync_says_what_external_secrets_said() -> None:
+    message = "error retrieving secret at .data[0], key: risk-batch--warehouse-password, err: Secret does not exist"
+    assert sync_state(_external_secret(1, "False", message=message), 1) == (False, f"not synced: {message}")

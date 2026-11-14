@@ -32,6 +32,9 @@ _REQUEST_SECONDS = 60
 _PROXY_START_SECONDS = 30
 _NEW_KIND_SECONDS = 30  # how long a kind from a CRD applied moments ago may take to be served
 _PAGE = 500
+# External Secrets reconciles a changed ExternalSecret within seconds. A Ready=False seen for longer than this is its
+# answer for the version applied, not one left over from the version before.
+SECRET_GRACE_SECONDS = 20.0
 # Aggregated discovery (Kubernetes 1.30+): every group, version and resource in two requests.
 _DISCOVERY = "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList,application/json"
 _APPLY = "application/apply-patch+yaml"  # JSON is YAML, so berth sends JSON
@@ -391,6 +394,39 @@ class ApiServer:
             if why.startswith("failed") or time.monotonic() > deadline:
                 return why
             time.sleep(poll_seconds)
+
+    def secret_synced(self, namespace: str, name: str, generation: int, deadline: float, *, poll_seconds: float = 2.0) -> str | None:
+        """Wait, until the monotonic `deadline`, for External Secrets to sync this generation of an ExternalSecret.
+        None when it did, otherwise why not, with the operator's own message (which names a missing key)."""
+        resource = self.resource("external-secrets.io/v1", "ExternalSecret")
+        failing_since: float | None = None
+        while True:
+            found = self.get(resource, name, namespace)
+            if found is None:
+                return "the ExternalSecret does not exist"
+            synced, why = sync_state(found, generation)
+            if synced is True:
+                return None
+            now = time.monotonic()
+            failing_since = (failing_since or now) if synced is False else None
+            if now > deadline or (failing_since is not None and now - failing_since >= SECRET_GRACE_SECONDS):
+                return why
+            time.sleep(poll_seconds)
+
+
+def sync_state(external_secret: Mapping[str, object], generation: int) -> tuple[bool | None, str]:
+    """Whether External Secrets synced this generation of an ExternalSecret: True, False (it reported Ready=False), or
+    None (not yet), with why. A sync records `syncedResourceVersion` as `<generation>-<hash of the metadata>`."""
+    status = _mapping(external_secret.get("status"))
+    ready = next((_mapping(item) for item in _list(status.get("conditions")) if _mapping(item).get("type") == "Ready"), None)
+    if ready is None:
+        return None, "External Secrets has not reported on it"
+    message = str(ready.get("message") or ready.get("reason") or "no message")
+    if ready.get("status") == "False":
+        return False, f"not synced: {message}"
+    if ready.get("status") == "True" and str(status.get("syncedResourceVersion", "")).startswith(f"{generation}-"):
+        return True, ""
+    return None, f"External Secrets has not synced this version yet (last: {message})"
 
 
 def _count(values: Mapping[str, object], key: str, default: int = 0) -> int:

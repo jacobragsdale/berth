@@ -10,6 +10,8 @@ import json
 import os
 import shutil
 import subprocess
+import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -19,7 +21,7 @@ import pytest
 from apiserver import BIN, TOKEN, apiserver
 from support import REPO
 
-from berth import gitio
+from berth import gitio, kube, operate
 from berth.cli import parse, run
 from berth.fleet import load
 from berth.kube import helm_template
@@ -289,6 +291,58 @@ def test_a_service_keeps_its_replicas_when_it_starts_autoscaling_and_git_takes_t
         env_file.write_text(original)
         cluster.commit("restore")
         assert cluster.berth(*deploy)[0] == 0
+
+
+def _generation(cluster: Cluster, kind: str, name: str, namespace: str) -> int:
+    return int(cluster.kubectl("get", kind, name, "-n", namespace, "-o", "jsonpath={.metadata.generation}").stdout or 0)
+
+
+def _report_sync(cluster: Cluster, namespace: str, *, ready: bool, message: str, generation: int) -> None:
+    """What External Secrets Operator writes, through the status subresource, once it has tried to sync."""
+    condition = {"type": "Ready", "status": str(ready), "reason": "SecretSynced" if ready else "SecretSyncedError", "message": message, "lastTransitionTime": "2026-11-09T14:00:00Z"}
+    status = {"status": {"conditions": [condition], "syncedResourceVersion": f"{generation if ready else generation - 1}-0a1b2c"}}
+    done = cluster.kubectl("patch", "externalsecret", "risk-batch-secrets", "-n", namespace, "--subresource=status", "--type=merge", "-p", json.dumps(status))
+    assert done.returncode == 0, done.stderr
+
+
+def test_a_jobs_only_app_whose_secret_is_missing_fails_its_deploy_with_the_operators_message(cluster: Cluster, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(operate, "ROLLOUT_SECONDS", 60)
+    monkeypatch.setattr(kube, "SECRET_GRACE_SECONDS", 1.0)
+    app = cluster.repo / "apps/risk-batch/app.yaml"
+    original = app.read_text()
+    deploy = ("deploy", "--cluster", "aks-qa", "--app", "risk-batch", "--env", "dev")  # and wait: no --no-wait
+    missing = "error retrieving secret at .data[1], key: risk-batch--vendor-token, err: Secret does not exist"
+    before = _generation(cluster, "externalsecret", "risk-batch-secrets", "risk-batch-dev")
+
+    def operator() -> None:
+        """Sync the new version of the ExternalSecret once the deploy applies it, and fail: one key is not in Key Vault."""
+        for _ in range(100):
+            generation = _generation(cluster, "externalsecret", "risk-batch-secrets", "risk-batch-dev")
+            if generation > before:
+                _report_sync(cluster, "risk-batch-dev", ready=False, message=missing, generation=generation)
+                return
+            time.sleep(0.2)
+
+    try:
+        app.write_text(original.replace("secrets: [warehouse-password]", "secrets: [warehouse-password, vendor-token]"))
+        cluster.commit("risk-batch reads a vendor token")
+        thread = threading.Thread(target=operator)
+        thread.start()
+        code, out = cluster.berth(*deploy)
+        thread.join()
+        assert code == 2, out
+        assert f"risk-batch-dev: ExternalSecret/risk-batch-secrets not synced: {missing}" in out
+        assert "risk-batch-dev: not deployed" in cluster.drift()  # not stamped, so the next deploy tries again
+
+        # Someone adds the secret to Key Vault, and External Secrets syncs it.
+        _report_sync(cluster, "risk-batch-dev", ready=True, message="secret synced", generation=before + 1)
+        code, out = cluster.berth(*deploy)
+        assert code == 0, out
+        assert "1 deployed" in out
+    finally:
+        app.write_text(original)
+        cluster.commit("restore")
+        assert cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")[0] == 0
 
 
 def test_an_object_made_by_hand_is_reported(cluster: Cluster) -> None:

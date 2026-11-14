@@ -252,7 +252,7 @@ The tutorial ([Add your first app](tutorial.md)) runs entirely on a laptop. It c
 
 ## Failure is contained
 
-A bad version stalls instead of breaking. Deployments roll with `maxUnavailable: 0` behind readiness probes, so old pods keep serving until new ones are ready, and the deploy waits for each rollout and fails that app environment if it does not finish. The app's next environment is then held, so the change goes no further, while every other app deploys as usual. In production, services spread across zones, and those with two or more pods get a disruption budget. berth does not roll back automatically: with a few pods per service a statistical canary is mostly noise. Rolling back is reverting the commit.
+A bad version stalls instead of breaking. Deployments roll with `maxUnavailable: 0` behind readiness probes, so old pods keep serving until new ones are ready, and the deploy waits for each rollout and fails that app environment if it does not finish. It also waits for External Secrets to sync each secret it applied, so a key missing from Key Vault fails the deploy with the operator's message, even for an app that only runs jobs and has no rollout to watch. A Ready=False must last 20 seconds to count, because the ExternalSecret has no observed generation: only a successful sync records which version it was. The app's next environment is then held, so the change goes no further, while every other app deploys as usual. In production, services spread across zones, and those with two or more pods get a disruption budget. berth does not roll back automatically: with a few pods per service a statistical canary is mostly noise. Rolling back is reverting the commit.
 
 ## Alternatives considered
 
@@ -316,7 +316,7 @@ Not run anywhere real, and marked so in each file that talks to it:
   - `az acr manifest show-metadata`.
 - **AKS:**
   - rollouts actually completing, since the test API server has no nodes;
-  - External Secrets Operator and Envoy Gateway running;
+  - External Secrets Operator and Envoy Gateway running, and the status External Secrets writes: the tests write `Ready` and `syncedResourceVersion` as its source and CRD describe them, but no real operator has synced a secret for a deploy to wait on;
   - the Gateway's internal load balancer annotations, through Gateway API's `infrastructure` field;
   - owners as `User` subjects in RoleBindings, which assumes AKS-managed Entra ID uses the user principal name;
   - Entra PIM group membership reaching the cluster's tokens after `kubelogin remove-tokens`;

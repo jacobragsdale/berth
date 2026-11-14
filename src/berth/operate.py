@@ -16,6 +16,7 @@ reports in plain lines, so a pipeline log reads as a record of what happened.
 
 import hashlib
 import threading
+import time
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
@@ -349,10 +350,27 @@ def _prune(site: Site, ns: str, docs: list[dict[str, object]], live: list[Object
     return lines
 
 
-def _not_ready(site: Site, ns: str, docs: list[dict[str, object]]) -> list[str]:
-    """Wait for each Deployment's rollout; one line for each that did not finish."""
-    waits = ((name, site.api.rollout(ns, name, ROLLOUT_SECONDS)) for name in (drift.object_name(doc) for doc in docs if doc.get("kind") == "Deployment"))
-    return [f"{ns}: {name} did not become ready: {why}" for name, why in waits if why is not None]
+def _not_ready(site: Site, ns: str, applied: list[Applied]) -> list[str]:
+    """Wait, within one budget per namespace, for External Secrets to sync each ExternalSecret applied, then for each
+    Deployment's rollout; one line for each that did not finish. A jobs-only app has no rollout, so a secret missing
+    from Key Vault would otherwise show only when its next scheduled run fails."""
+    deadline = time.monotonic() + ROLLOUT_SECONDS
+    lines: list[str] = []
+    for item in applied:
+        if item.kind == "ExternalSecret" and item.stored is not None:
+            generation = _mapping_int(item.stored.get("metadata"), "generation")
+            why = site.api.secret_synced(ns, item.name, generation, deadline)
+            lines += [f"{ns}: ExternalSecret/{item.name} {why}"] if why is not None else []
+    for item in applied:
+        if item.kind == "Deployment":
+            why = site.api.rollout(ns, item.name, max(0.0, deadline - time.monotonic()))
+            lines += [f"{ns}: {item.name} did not become ready: {why}"] if why is not None else []
+    return lines
+
+
+def _mapping_int(value: object, key: str) -> int:
+    found = value.get(key) if isinstance(value, Mapping) else None
+    return found if isinstance(found, int) else 0
 
 
 _AUTOSCALER = "HorizontalPodAutoscaler"  # rendered with the name of the Deployment it scales
@@ -401,9 +419,9 @@ def _apply_namespace(site: Site, target: Target, options: DeployOptions, live: l
     if lines:
         return State.FAILED, "conflicts with changes made by hand" if conflicts else "apply failed", handed_over + lines
     lines = [f"{ns}: applied {len(applied)} objects", *handed_over, *_hand_changes(site, ns, applied, options), *_prune(site, ns, docs, live, options)]
-    not_ready = _not_ready(site, ns, docs) if options.wait else []
+    not_ready = _not_ready(site, ns, applied) if options.wait else []
     if not_ready:
-        return State.FAILED, "a rollout did not finish", lines + not_ready
+        return State.FAILED, "not ready: " + "; ".join(line.removeprefix(f"{ns}: ") for line in not_ready), lines + not_ready
     stamps = {drift.DEPLOYED_DIGEST: target.digest, drift.DEPLOYED_COMMIT: options.commit, drift.DEPLOYED_AT: options.now.isoformat()}
     site.api.annotate(ObjectRef.of("v1", "Namespace", ns), stamps, manager=STAMP_MANAGER)
     return State.DEPLOYED, "", lines
