@@ -250,7 +250,7 @@ def test_a_change_adopted_into_the_spec_deploys_cleanly_and_stops_being_drift(cl
         cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "ledger", "--env", "qa", "--revert")
 
 
-def test_a_service_keeps_its_replicas_when_it_starts_autoscaling_and_git_takes_them_back_when_it_stops(cluster: Cluster) -> None:
+def test_a_service_keeps_its_replicas_when_it_starts_autoscaling_and_git_takes_them_back_when_it_stops(cluster: Cluster, tmp_path: Path) -> None:
     env_file = cluster.repo / "apps/ledger/qa.yaml"
     original = env_file.read_text()
     deploy = ("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "ledger", "--env", "qa")
@@ -266,6 +266,11 @@ def test_a_service_keeps_its_replicas_when_it_starts_autoscaling_and_git_takes_t
 
         env_file.write_text(original + "services:\n  api: {autoscale: {min: 3, max: 8}}\n")
         cluster.commit("autoscale ledger in qa")
+        details = tmp_path / "drift.txt"
+        assert cluster.berth("drift", "--cluster", "aks-qa", "--details", str(details))[0] == 0
+        report = details.read_text()
+        assert "+++ git/HorizontalPodAutoscaler/ledger-api" in report
+        assert "Deployment/ledger-api" not in report  # the report shows what the deploy will do: keep the count, not drop to 1
         code, out = cluster.berth(*deploy)
         assert code == 0, out
         assert "Deployment/ledger-api keeps 5 replicas until its autoscaler takes over" in out

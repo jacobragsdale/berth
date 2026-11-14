@@ -1,4 +1,5 @@
-# rendered/ is generated: fixers must not touch it, and `berth check` already proves it matches the specs.
+# rendered/ is what `berth render` writes for reading. git ignores it, so hooks never see it; this keeps it that way
+# if someone adds it by mistake. What runs is rendered in memory by `berth deploy` and published to the rendered branch.
 exclude: ^rendered/
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -7,7 +8,7 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
-        args: [--allow-multiple-documents]  # Kubernetes manifests and Kyverno fixtures are multi-document
+        args: [--allow-multiple-documents]  # rendered Kubernetes manifests are; a test fixture made from them would be
       - id: check-toml
       - id: check-added-large-files
       - id: check-merge-conflict

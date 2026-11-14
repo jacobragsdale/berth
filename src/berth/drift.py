@@ -348,7 +348,7 @@ def hand_changes(ref: ObjectRef, expected: frozenset[str] = EXPECTED_MANAGERS) -
     ]
 
 
-def _spec(obj: Mapping[str, object]) -> Mapping[str, object]:
+def spec_of(obj: Mapping[str, object]) -> dict[str, object]:
     spec = obj.get("spec")
     return {str(key): value for key, value in spec.items()} if isinstance(spec, Mapping) else {}
 
@@ -365,9 +365,9 @@ def replicas_to_hold(doc: Mapping[str, object], live: ObjectRef | None) -> int |
     default, so the Deployment would drop to one pod until the autoscaler acted. Held by a second applier, the count
     stays where it is and the autoscaler takes it from there. None when git never set the count, or still does.
     """
-    if live is None or doc.get("kind") != "Deployment" or "replicas" in _spec(doc) or FIELD_MANAGER not in _replica_owners(live):
+    if live is None or doc.get("kind") != "Deployment" or "replicas" in spec_of(doc) or FIELD_MANAGER not in _replica_owners(live):
         return None
-    count = _spec(live.body).get("replicas")
+    count = spec_of(live.body).get("replicas")
     return count if isinstance(count, int) else None
 
 
@@ -375,7 +375,7 @@ def reclaims_replicas(doc: Mapping[str, object], live: ObjectRef | None, expecte
     """Whether applying a Deployment takes its replica count back from an autoscaler, because the service stopped
     autoscaling. That is no change made by hand, so the apply may override it rather than stop with a conflict. Not
     when a person changed something else in the object: then the conflict is worth seeing."""
-    if live is None or doc.get("kind") != "Deployment" or "replicas" not in _spec(doc):
+    if live is None or doc.get("kind") != "Deployment" or "replicas" not in spec_of(doc):
         return False
     return bool(_replica_owners(live) & {HANDOVER_MANAGER, _CONTROLLERS}) and not hand_changes(live, expected)
 

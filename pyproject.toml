@@ -31,7 +31,7 @@ dev = [
 line-length = 200
 required-version = ">=0.17.3"
 force-exclude = true
-extend-exclude = ["rendered"]  # generated; berth check proves it matches the specs, so a linter must not rewrite it
+extend-exclude = ["rendered"]  # written by `berth render` and ignored by git: generated DAGs a linter must not rewrite
 show-fixes = true
 unsafe-fixes = false
 
@@ -42,9 +42,9 @@ ignore = [
     "COM812",  # Conflicts with the formatter; Ruff's docs say to disable it alongside ruff format.
     "ISC001",  # Conflicts with the formatter; Ruff's docs say to disable it alongside ruff format.
     "S603",  # Flags every subprocess call; there is no fix, only review. Pass argv lists, never shell=True (S602).
-    "TC001",  # Moving imports under TYPE_CHECKING breaks code that reads annotations at runtime (Pydantic, FastAPI).
-    "TC002",  # Moving imports under TYPE_CHECKING breaks code that reads annotations at runtime (Pydantic, FastAPI).
-    "TC003",  # Moving imports under TYPE_CHECKING breaks code that reads annotations at runtime (Pydantic, FastAPI).
+    "TC001",  # Moving imports under TYPE_CHECKING breaks code that reads annotations at runtime (Pydantic models).
+    "TC002",  # Moving imports under TYPE_CHECKING breaks code that reads annotations at runtime (Pydantic models).
+    "TC003",  # Moving imports under TYPE_CHECKING breaks code that reads annotations at runtime (Pydantic models).
     "CPY001",  # A copyright header is a legal decision per repository, not a lint fix.
     "D",  # Agents read this code. A required docstring gets written to satisfy the rule; write one only where it says what code and types cannot.
 ]
@@ -87,7 +87,7 @@ testpaths = ["tests"]
 pythonpath = ["tests"]  # for tests/support.py, the shared spec builders; test modules themselves stay unimportable
 xfail_strict = true  # An xfail that starts passing is a failure, not a silent pass.
 filterwarnings = [
-    "error",  # pandas 3 chained assignment only warns; the lost write is otherwise invisible.
+    "error",  # A warning from berth or its dependencies fails the test, so a deprecation is seen while it is cheap to fix.
     # Add narrow, dated `ignore::` entries with a reason for third-party
     # deprecations you do not control. Never widen this back to "default".
 ]

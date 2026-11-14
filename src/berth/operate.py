@@ -645,11 +645,15 @@ def _object_diffs(site: Site, target: Target, namespace: ObjectRef, live: list[O
     chunks: list[str] = []
     for doc in site.rendered(target):
         label = f"{doc.get('kind')}/{drift.object_name(doc)}"
-        applied = site.api.apply(doc, force=True, dry_run=True)
+        current = by_key.get((str(doc.get("kind")), drift.object_name(doc)))
+        held = drift.replicas_to_hold(doc, current)
+        # A deploy holds the count of a Deployment that starts autoscaling (berth-handover), so the diff does too,
+        # rather than show it falling to the default of one pod.
+        wanted = doc if held is None else {**doc, "spec": {**drift.spec_of(doc), "replicas": held}}
+        applied = site.api.apply(wanted, force=True, dry_run=True)
         if applied.stored is None:
             changed.append(f"{label} (cannot dry-run: {applied.error})")
             continue
-        current = by_key.get((str(doc.get("kind")), drift.object_name(doc)))
         chunk = drift.object_diff(label, current.body if current is not None else None, applied.stored)
         if chunk:
             changed.append(label)
