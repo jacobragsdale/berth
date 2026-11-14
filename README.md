@@ -82,8 +82,11 @@ People edit `apps/<app>/app.yaml` and one file per environment, `apps/<app>/<env
 ```sh
 uv run pre-commit run --all-files
 uv run pytest
+uv run berth check
 scripts/validate-rendered.sh
 uv run pytest -m integration
 ```
+
+`.github/workflows/ci.yml` runs the same five checks on every push and pull request to `main` on GitHub. `uv run pytest -m scale` times `check`, `render`, `deploy` and `drift` on 300 synthetic apps; it takes about four minutes and is not part of either run.
 
 `scripts/fetch-tools.sh` downloads checksum-verified kubeconform v0.8.0, Helm v4.3.1, and envtest v1.34.1 (kube-apiserver, etcd and kubectl) into `.tools/`; the other scripts call it. `validate-rendered.sh` renders the specs and schema-checks the result, offline after the first run. `pytest -m integration` starts a local API server for the deploy, drift and admission tests, and also runs `validate-rendered.sh` and `validate-software.sh`, which downloads and renders the platform software charts.

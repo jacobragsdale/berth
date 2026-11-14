@@ -1,0 +1,43 @@
+# The same checks as pipelines/pr.yml, on GitHub, where this repository lives: lint, format and types, unit tests,
+# the specs, Kubernetes schemas on everything rendered, and deploys against a real API server. Tools are pinned as
+# the Azure templates pin them: uv 0.13.6 here, and kubeconform, Helm and envtest in scripts/fetch-tools.sh.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0  # review and the tests read main's history
+          persist-credentials: false
+      - name: Install uv 0.13.6
+        run: |
+          curl -LsSf https://astral.sh/uv/0.13.6/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install berth
+        run: uv sync --locked
+      - name: Lint, format, types
+        run: uv run pre-commit run --all-files --show-diff-on-failure
+      - name: Unit tests
+        run: uv run pytest
+      - name: Specs valid and render; schemas and pipeline targets up to date
+        run: uv run berth check
+      - name: Kubernetes schemas on everything rendered
+        run: scripts/validate-rendered.sh
+      - name: Deploy, drift and admission policies against a real API server
+        run: uv run pytest -m integration
