@@ -407,6 +407,24 @@ class Rightsizing(Spec):
         return self
 
 
+class Limit(Spec):
+    """A share of a whole, with a floor for small wholes: exceeded by more than `floor` items and more than `share` of the whole."""
+
+    share: float = Field(gt=0, le=1)
+    floor: int = Field(ge=0)
+
+    def exceeded(self, count: int, whole: int) -> bool:
+        return count > max(self.floor, self.share * whole)
+
+
+class Deploys(Spec):
+    """Brakes on what one `berth deploy` may do to a cluster without a person deciding."""
+
+    # A run that would delete more of the objects berth made in a cluster's app namespaces deletes none of them, and
+    # deploys nothing: a renderer bug that drops one kind for every app looks exactly like this.
+    prune_limit: Limit = Limit(share=0.05, floor=20)
+
+
 class Platform(Spec):
     registry: str
     tenant_id: str
@@ -426,6 +444,7 @@ class Platform(Spec):
     # Links shown by `berth explain` and in the drift report, e.g. to the service in Datadog.
     links: dict[Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9-]{0,30}$")], LinkTemplate] = Field(default_factory=dict)
     freezes: tuple[Freeze, ...] = ()
+    deploys: Deploys = Field(default_factory=Deploys)
 
     @model_validator(mode="after")
     def _references_known(self) -> Self:

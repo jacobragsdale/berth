@@ -27,8 +27,13 @@ parameters:
     displayName: Put git back over changes made by hand
     type: boolean
     default: false
-  - name: prune
-    displayName: Delete objects git no longer renders (never namespaces or volumes)
+  # Deploys delete what git no longer renders (never namespaces or volumes), up to platform.yaml's deploys.prune_limit.
+  - name: noPrune
+    displayName: Keep objects git no longer renders
+    type: boolean
+    default: false
+  - name: pruneAll
+    displayName: Delete past the prune brake
     type: boolean
     default: false
 
@@ -71,7 +76,8 @@ stages:
                             if [ -f "$earlier" ]; then args+=(--hold-from "$earlier"); fi
                           done
                           if [ "${{ parameters.revert }}" = "True" ]; then args+=(--revert); fi
-                          if [ "${{ parameters.prune }}" = "True" ]; then args+=(--prune); fi
+                          if [ "${{ parameters.noPrune }}" = "True" ]; then args+=(--no-prune); fi
+                          if [ "${{ parameters.pruneAll }}" = "True" ]; then args+=(--prune-all); fi
                           code=0
                           uv run berth deploy "${args[@]}" || code=$?
                           case "$code" in

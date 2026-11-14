@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import Literal, TextIO
+from typing import Literal, TextIO, TypeIs
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -125,7 +125,8 @@ class DeployOptions:
     app: str | None = None  # only this app, and leave the platform alone
     env: str | None = None  # with app: only this environment
     everything: bool = False  # also apply namespaces that already run what git renders
-    prune: bool = False
+    prune: bool = True  # delete what git dropped from the namespaces it still renders, and stop retired environments
+    prune_all: bool = False  # delete it even past the platform's prune limit
     revert: bool = False  # put git back: take back fields changed by hand, remove fields added by hand
     wait: bool = True
     include_break_glass: bool = False
@@ -150,6 +151,11 @@ class Seen:
     others: Mapping[str, list[ObjectRef]] = field(default_factory=dict)  # everything else, when drift asks for it
 
 
+def _breaks_glass(mark: BreakGlass | None, options: DeployOptions) -> TypeIs[BreakGlass]:
+    """Whether a deploy must leave a namespace alone because someone broke glass there."""
+    return mark is not None and mark.active(options.now) and not options.include_break_glass
+
+
 def decide(target: Target, seen: Seen, outcomes: Mapping[tuple[str, str], Outcome], fleet: Fleet, options: DeployOptions) -> Outcome | None:
     """What to do with one app namespace, without touching it: an outcome that needs no deploy, or None to deploy it."""
 
@@ -164,7 +170,7 @@ def decide(target: Target, seen: Seen, outcomes: Mapping[tuple[str, str], Outcom
     before = outcomes.get((target.app, source)) if source is not None else None
     if before is not None and before.state in _STOPPED:
         return outcome(State.HELD, f"{target.app} {before.state} in {source} in this run, and {target.env} promotes from {source}")
-    if mark is not None and mark.active(options.now) and not options.include_break_glass:
+    if _breaks_glass(mark, options):
         return outcome(State.SKIPPED, f"break-glass by {mark.by} until {mark.until:%Y-%m-%d %H:%M %Z} ({mark.reason})")
     deployed = annotations.get(drift.DEPLOYED_COMMIT)
     if deployed is not None and deployed != options.commit and options.newer(deployed):
@@ -311,7 +317,7 @@ def _prune(site: Site, ns: str, docs: list[dict[str, object]], live: list[Object
             site.api.delete(gone)
             lines.append(f"{ns}: deleted {gone.kind}/{gone.name} (no longer in git)")
         else:
-            lines.append(f"{ns}: {gone.kind}/{gone.name} is no longer in git; deploy with --prune to delete it")
+            lines.append(f"{ns}: kept {gone.kind}/{gone.name}, which git no longer renders (--no-prune)")
     return lines
 
 
@@ -345,7 +351,8 @@ def _hand_over_replicas(site: Site, ns: str, docs: list[dict[str, object]], live
         elif drift.reclaims_replicas(doc, current):
             reclaimed.add(name)
             if name in dropped:
-                # Not left for --prune: an autoscaler git dropped would go on overriding the count git now sets.
+                # Deleted before the apply, not with the rest of what git dropped after it, and even with --no-prune:
+                # in between, the autoscaler would go on overriding the count git now sets.
                 site.api.delete(dropped[name])
                 lines.append(f"{ns}: deleted {_AUTOSCALER}/{name}: git sets the replica count now")
     return reclaimed, lines
@@ -397,17 +404,68 @@ def _retire(site: Site, settled: list[Target], live: Mapping[str, list[ObjectRef
         log.write(f"{target.namespace}: deleted ConfigMap/{item.name}, superseded more than {drift.SUPERSEDED_GRACE.days} days ago" for item in plan.delete)
 
 
+def _retired(every: list[Target], seen: Seen, options: DeployOptions) -> list[str]:
+    """berth's namespaces on the cluster with no environment file in git, whose workloads a full deploy stops."""
+    if options.app is not None:
+        return []
+    wanted = {target.namespace for target in every}
+    return sorted(name for name in seen.namespaces if name not in wanted)
+
+
+def _would_prune(site: Site, chosen: list[Target], retired: list[str], seen: Seen, options: DeployOptions) -> dict[str, list[ObjectRef]]:
+    """What this run would delete, by namespace, before anything is applied: what git dropped from each namespace the
+    run may deploy, and what berth made in retired environments. Held namespaces are counted too, to err on the side
+    of the brake."""
+    planned: dict[str, list[ObjectRef]] = {}
+    for target in chosen:
+        namespace = seen.namespaces.get(target.namespace)
+        current = namespace is not None and namespace.annotations.get(drift.DEPLOYED_DIGEST) == target.digest
+        if not (current and not options.reapply) and not _breaks_glass(seen.marks.get(target.namespace), options):
+            planned[target.namespace] = drift.prune_plan(site.rendered(target), seen.managed.get(target.namespace, []))
+    for name in retired:
+        if not _breaks_glass(seen.marks.get(name), options):
+            planned[name] = drift.prune_plan([], seen.managed.get(name, []))
+    return {name: items for name, items in planned.items() if items}
+
+
+def _stop_retired(site: Site, retired: list[str], seen: Seen, options: DeployOptions, log: _Log) -> None:
+    """Delete what berth made in each retired environment, so its workloads stop. What a person must decide stays:
+    the Namespace, its volume claims, and anything marked to keep."""
+    for name in retired:
+        gone = drift.prune_plan([], seen.managed.get(name, []))
+        mark = seen.marks.get(name)
+        if _breaks_glass(mark, options):
+            log.write([f"{name}: on the cluster but no longer in git; left alone, break-glass by {mark.by} until {mark.until:%Y-%m-%d %H:%M %Z}"])
+        elif options.prune:
+            for item in gone:
+                site.api.delete(item)
+            # It no longer runs what it was stamped with, so should git bring it back, the next deploy applies it.
+            site.api.annotate(ObjectRef.of("v1", "Namespace", name), {}, manager=STAMP_MANAGER)
+            stopped = f"deleted {len(gone)} objects berth made there" if gone else "nothing berth made is left there"
+            log.write([f"{name}: on the cluster but no longer in git; {stopped}. Delete the Namespace, with its volume claims, once nobody needs them"])
+        else:
+            log.write([f"{name}: on the cluster but no longer in git; kept {len(gone)} objects berth made there (--no-prune), so its workloads keep running"])
+
+
 def deploy(site: Site, options: DeployOptions, out: TextIO) -> Results:
     """Apply what differs, environment by environment. One app failing does not stop the others."""
     log = _Log(out)
+    every = targets(site.fleet, site.cluster, site.files)
+    chosen = [t for t in every if options.app in (None, t.app) and options.env in (None, t.env)]
+    seen = site.look()
+    retired = _retired(every, seen, options)
+    if options.prune and not options.prune_all:
+        whole = sum(len(items) for name, items in seen.managed.items() if name in seen.namespaces)
+        brake = drift.prune_brake(_would_prune(site, chosen, retired, seen, options), whole, site.fleet.platform.deploys.prune_limit)
+        if brake:
+            log.write(brake)
+            return Results(cluster=site.cluster, commit=options.commit, platform="failed")
     platform: Literal["deployed", "failed", "skipped"] = "skipped"
     if options.app is None:
         if not _apply_platform(site, options, log):
             log.write(["platform failed; apps were not deployed"])
             return Results(cluster=site.cluster, commit=options.commit, platform="failed")
         platform = "deployed"
-    chosen = [t for t in targets(site.fleet, site.cluster, site.files) if options.app in (None, t.app) and options.env in (None, t.env)]
-    seen = site.look()
     outcomes: dict[tuple[str, str], Outcome] = dict(options.holds)
     results: dict[str, Outcome] = {}
     with ThreadPoolExecutor(max_workers=max(1, options.jobs)) as pool:
@@ -428,9 +486,7 @@ def deploy(site: Site, options: DeployOptions, out: TextIO) -> Results:
                 results[target.namespace] = outcomes[(target.app, target.env)] = outcome
     # Not where someone broke glass: an emergency fix may point a workload at old settings on purpose.
     _retire(site, [t for t in chosen if results[t.namespace].state in SETTLED and t.namespace not in seen.marks], seen.managed, options.now, log)
-    if options.app is None:
-        wanted = {target.namespace for target in targets(site.fleet, site.cluster, site.files)}
-        log.write(f"{name}: on the cluster but no longer in git; its workloads keep running until someone removes them" for name in sorted(set(seen.namespaces) - wanted))
+    _stop_retired(site, retired, seen, options, log)
     counts = {state: sum(item.state is state for item in results.values()) for state in State}
     log.write([", ".join(f"{count} {state}" for state, count in counts.items() if count) or "no app environments on this cluster"])
     stopped = sorted(name for name, item in results.items() if item.state in _STOPPED)

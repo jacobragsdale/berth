@@ -7,7 +7,7 @@ After a merge, a pipeline renders `main` and applies it with server-side apply, 
 It is a proof of concept with invented apps and `contoso` placeholders. Locally verified:
 
 - the unit tests, and end-to-end runs of the CLI in throwaway git repositories
-- `berth deploy`, `drift`, `breakglass`, `--revert` and `--prune` against a real Kubernetes API server and etcd (envtest 1.34): holds, parallel deploys, retiring old settings, and what the break-glass role may and may not do
+- `berth deploy`, `drift`, `breakglass` and `--revert` against a real Kubernetes API server and etcd (envtest 1.34): holds, parallel deploys, deleting what git dropped and the brake on deleting too much, retiring old settings, and what the break-glass role may and may not do
 - the built-in admission policies refusing what they should, and admitting every pod Airflow and Control-M start
 - publishing to the `rendered` branch, against a local git remote
 - rendered manifests against Kubernetes 1.33 and 1.34 and CRD schemas (kubeconform)

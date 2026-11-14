@@ -64,7 +64,7 @@ The [OpenGitOps v1.0 principles](https://opengitops.dev/) are declarative state,
 | A version reaches prod only after the previous stage | Monzo, Netflix `depends-on` | promotion escalation from git history |
 | Checks that delay rather than reject | Google Annealing, Uber windows | `freezes` |
 | Breakglass that is fast and audited | Google BSRS | `berth breakglass` marks, the `break-glass` label, and the daily drift report |
-| No deletion by absence | Google Prodspec | prune only with `--prune`, never namespaces or volumes |
+| No deletion by absence | Google Prodspec | all-or-nothing rendering; never prune namespaces or volumes; a brake on deleting a large share at once |
 | Shared changes reported to the services they reach | Meta AutoCanary | "rendered output changes without a spec change" |
 | One source rendering two schedulers | Stripe | `orchestrator: airflow` or `controlm` |
 | Curated menus plus a counted escape hatch | Meta Twine, SRE Workbook | `sizes`, `overrides` with a required reason |

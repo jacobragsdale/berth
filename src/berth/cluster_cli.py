@@ -38,6 +38,7 @@ class Deploy:
     env: str | None
     everything: bool
     prune: bool
+    prune_all: bool
     revert: bool
     wait: bool
     include_break_glass: bool
@@ -106,7 +107,9 @@ def add_commands(sub: "argparse._SubParsersAction[argparse.ArgumentParser]") -> 
     deploy.add_argument("--app", help="only this app, and leave the platform alone")
     deploy.add_argument("--env", help="with --app: only this environment")
     deploy.add_argument("--all", action="store_true", dest="everything", help="also apply namespaces that already run what git renders")
-    deploy.add_argument("--prune", action="store_true", help="delete objects berth made that git no longer has (never namespaces or volumes)")
+    pruning = deploy.add_mutually_exclusive_group()
+    pruning.add_argument("--no-prune", action="store_true", help="keep objects berth made that git no longer renders; by default they are deleted (never namespaces or volumes)")
+    pruning.add_argument("--prune-all", action="store_true", help="delete them even past platform.yaml's deploys.prune_limit")
     deploy.add_argument("--revert", action="store_true", help="put git back: take back fields changed by hand and remove fields added by hand")
     deploy.add_argument("--no-wait", action="store_true", help="do not wait for rollouts")
     deploy.add_argument("--include-break-glass", action="store_true", help="also deploy namespaces marked break-glass")
@@ -143,7 +146,20 @@ def parse(ns: argparse.Namespace, root: Path, error: Callable[[str], object]) ->
                 error("--env needs --app")
             connection = Connection(ns.cluster, ns.context, ns.kubeconfig)
             return Deploy(
-                root, connection, ns.app, ns.env, ns.everything, ns.prune, ns.revert, not ns.no_wait, ns.include_break_glass, not ns.no_software, ns.jobs, ns.results_out, tuple(ns.hold_from)
+                root,
+                connection,
+                ns.app,
+                ns.env,
+                ns.everything,
+                not ns.no_prune,
+                ns.prune_all,
+                ns.revert,
+                not ns.no_wait,
+                ns.include_break_glass,
+                not ns.no_software,
+                ns.jobs,
+                ns.results_out,
+                tuple(ns.hold_from),
             )
         case "drift":
             if ns.context is not None and len(ns.cluster) > 1:
@@ -189,6 +205,7 @@ def _deploy(cmd: Deploy, checked: Checked, out: TextIO, now: datetime) -> int:
         env=cmd.env,
         everything=cmd.everything,
         prune=cmd.prune,
+        prune_all=cmd.prune_all,
         revert=cmd.revert,
         wait=cmd.wait,
         include_break_glass=cmd.include_break_glass,

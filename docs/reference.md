@@ -100,6 +100,15 @@ An app must have at least one service or workflow.
 | `sizes.<name>` | `cpu`, `memory`, and `platform_review` (default `false`). The memory limit equals `memory`; there is no CPU limit. |
 | `identities` | `<app>/<env>` to workload identity client ID. |
 | `freezes` | `start`, `end` (time zone required) and `reason`. Production changes wait while a freeze is active. |
+| `deploys` | Brakes on what one deploy may do without a person; see [Deploy brakes](#deploy-brakes). Every field has a default. |
+
+## Deploy brakes
+
+`platform.yaml`'s `deploys` block. A limit is `{share, floor}`, and is exceeded by more than `floor` items when that is also more than `share` (0–1) of the whole.
+
+| Field | Default | Description |
+|---|---|---|
+| `prune_limit` | `{share: 0.05, floor: 20}` | A deploy that would delete more than this of the objects berth made in the cluster's app namespaces deletes nothing and applies nothing, and fails as the platform would (exit 1), listing the kinds by count. `--prune-all` goes past it; `--no-prune` deploys without deleting. |
 
 ## Rightsizing
 
@@ -266,16 +275,20 @@ berth talks to the API server through `kubectl proxy`, on a Unix socket in a dir
 | `unchanged` | The namespace's `berth.contoso.io/deployed-digest` equals the digest of what git renders for it, and neither `--all` nor `--revert` was given. Nothing is applied. |
 | `held` | The environment it promotes from failed or was held for the same app in this run, on this cluster or in a `--hold-from` results file. Nothing is applied. |
 | `skipped` | A `berth-break-glass` ConfigMap in the namespace has an expiry in the future (unless `--include-break-glass`), or the namespace's `berth.contoso.io/deployed-commit` descends from the commit being deployed. |
+
+Before applying anything, a deploy works out what it would delete: the objects git dropped from each namespace it may deploy, and what berth made in each retired environment. If that exceeds `deploys.prune_limit`, it stops there; see [Deploy brakes](#deploy-brakes).
 | `deployed` | Every object applied and, unless `--no-wait`, every Deployment finished rolling out within 600 seconds. |
 | `failed` | An object did not apply (a conflict with a change made by hand names the field), or a rollout did not finish. The namespace is not stamped, so the next deploy tries again. |
 
-A Deployment's replica count changes hands when its service starts or stops autoscaling, and a deploy moves it without moving a pod. When a service gets `autoscale`, git stops setting the count; berth first holds the live count as field manager `berth-handover`, because a field its only applier lets go of returns to its default of one pod. The autoscaler takes the count from there. When a service goes back to `replicas`, berth applies that Deployment over the autoscaler's count, which is no change made by hand, and deletes the HorizontalPodAutoscaler git dropped without waiting for `--prune`: left behind, it would go on overriding the count git now sets. If a person also changed the Deployment, the apply stops with the usual conflict instead.
+A Deployment's replica count changes hands when its service starts or stops autoscaling, and a deploy moves it without moving a pod. When a service gets `autoscale`, git stops setting the count; berth first holds the live count as field manager `berth-handover`, because a field its only applier lets go of returns to its default of one pod. The autoscaler takes the count from there. When a service goes back to `replicas`, berth applies that Deployment over the autoscaler's count, which is no change made by hand, and deletes the HorizontalPodAutoscaler git dropped before applying, even with `--no-prune`: left until after, it would go on overriding the count git now sets. If a person also changed the Deployment, the apply stops with the usual conflict instead.
 
 After applying a namespace it:
 
 - reports fields set by another field manager, other than `berth`, `berth-deploy`, `berth-break-glass`, `berth-handover` and `kube-controller-manager`, ignoring status, `kubectl.kubernetes.io/restartedAt`, and fields berth also sets (a change adopted into git); with `--revert`, removes them with a strategic merge patch (built-in kinds only);
-- lists objects labelled as berth's that git no longer renders; with `--prune`, deletes them, except Namespaces, PersistentVolumeClaims, versioned ConfigMaps and anything annotated `berth.contoso.io/keep: "true"`;
+- deletes objects labelled as berth's that git no longer renders, except Namespaces, PersistentVolumeClaims, versioned ConfigMaps, objects with owner references and anything annotated `berth.contoso.io/keep: "true"`; with `--no-prune`, lists them instead;
 - once deployed, stamps the namespace with `berth.contoso.io/deployed-digest`, `deployed-commit` and `deployed-at`, as field manager `berth-deploy`.
+
+Unless `--app` is given, every berth namespace on the cluster with no environment file in git is a retired environment. Without a break-glass mark, the deploy deletes what berth made there under the same exemptions, so its workloads stop, removes the namespace's deploy stamps, so the environment deploys in full if git brings it back, and reports it as on the cluster but no longer in git. The Namespace, its volume claims and anything kept stay for a person to delete. With `--no-prune`, it only reports it.
 
 Then, in every namespace that runs what git renders and has no break-glass mark, it retires versioned ConfigMaps that are neither rendered nor named by a live Deployment or CronJob. It annotates each with `berth.contoso.io/superseded-at` and deletes it once that is more than seven days old. A ConfigMap that is rendered again loses the annotation.
 
@@ -316,7 +329,7 @@ berth [--root ROOT] COMMAND
 | `schema` | `[--check]` | Writes the JSON Schemas in `platform/schema/`. |
 | `explain` | `APP --env ENV` | Prints the app's owners, namespace and image in `ENV`; how to look at it and its company URLs; every `links` entry; each merged setting with the file that set it (or `default`); the Kubernetes objects rendered; and the scheduler for each workflow. Exits 1 if the app does not run in `ENV`. |
 | `images` | `[--base REF]` | Prints `registry/repository@digest<TAB>tag` for every image the specs deploy, or only those not deployed at `REF`. |
-| `deploy` | `--cluster CLUSTER [--app APP [--env ENV]] [--all] [--prune] [--revert] [--no-wait] [--include-break-glass] [--no-software] [--jobs N] [--results-out PATH] [--hold-from PATH]… [--context CTX] [--kubeconfig PATH]` | See [Deploying and drift](#deploying-and-drift). Refuses to run unless the specs validate and render. With `--app`, deploys only that app (and not the platform). `--all` applies namespaces that are already up to date; `--revert` implies it. Exits 1 if the platform failed (no app was deployed), 2 if any app environment failed or was held, 0 otherwise. |
+| `deploy` | `--cluster CLUSTER [--app APP [--env ENV]] [--all] [--no-prune \| --prune-all] [--revert] [--no-wait] [--include-break-glass] [--no-software] [--jobs N] [--results-out PATH] [--hold-from PATH]… [--context CTX] [--kubeconfig PATH]` | See [Deploying and drift](#deploying-and-drift). Refuses to run unless the specs validate and render. With `--app`, deploys only that app (and not the platform). `--all` applies namespaces that are already up to date; `--revert` implies it. `--no-prune` deletes nothing; `--prune-all` deletes past the prune brake. Exits 1 if the platform failed or the prune brake stopped the run (no app was deployed), 2 if any app environment failed or was held, 0 otherwise. |
 | `drift` | `--cluster CLUSTER … [--slack] [--details PATH] [--full] [--jobs N] [--context CTX] [--kubeconfig PATH]` | Reports each cluster's drift. `--slack` posts the summary to `SLACK_WEBHOOK_URL`; `--details` writes the full diffs; `--full` diffs every namespace. |
 | `breakglass` | `APP --env ENV (--reason TEXT [--hours N] \| --end) [--context CTX] [--kubeconfig PATH]` | Writes the `berth-break-glass` ConfigMap in the app's namespace, with who (as the API server knows them), why and until when (default 8 hours), or deletes it. Warns if the user is not in the environment's `break_glass_groups`. |
 | `publish` | `--cluster CLUSTER [--results PATH] [--remote NAME] [--branch NAME] [--no-push]` | Commits the cluster's part of the rendered tree onto the branch (default `rendered`, on `origin`) and pushes it. With `--results`, app environments that did not deploy keep their previous files. Uses git's plumbing, so the checkout and index are untouched. The push is not forced. |

@@ -341,8 +341,8 @@ The report arrives in Slack every morning, one message per cluster, with one lin
 - **"made by hand: Kind/name"**: an object nobody rendered. Delete it with kubectl (a break-glass group member or the platform team), or add what it does to the spec.
 - **"not deployed"**: git renders something the last full deploy of that namespace did not apply, because a deploy failed, was held, or has not run yet. The deploy pipeline's last run says why; the next run tries again.
 - **"differs from git"** or **"missing"**: the cluster does not match git, for example after someone deleted an object. Deploy the app again with `--all`, or with `--revert` if a conflict blocks it.
-- **"(removed from git)"**: git no longer renders that object. Run the `berth-deploy` pipeline with **Delete objects git no longer renders** ticked, or from a clean checkout of `main`, `uv run berth deploy --cluster CLUSTER --app APP --env ENV --all --prune`. Prune only touches objects berth labelled, in the namespaces it deploys, and never namespaces or volume claims. Old settings ConfigMaps never appear here: deploys retire those themselves.
-- **"on the cluster but no longer in git"**: the app or environment was removed. A platform operator deletes the namespace once its data is no longer needed.
+- **"(removed from git)"**: git no longer renders that object, and no deploy has deleted it yet: the last one ran with `--no-prune`, stopped at the prune brake, or failed. From a clean checkout of `main`, run `uv run berth deploy --cluster CLUSTER --app APP --env ENV --all`. Prune only touches objects berth labelled, and never namespaces or volume claims. Old settings ConfigMaps never appear here: deploys retire those themselves.
+- **"on the cluster but no longer in git"**: the app or environment was removed, and deploys have deleted what berth made there. A platform operator deletes the namespace, with its volume claims, once its data is no longer needed.
 - **"break-glass … EXPIRED"**: the mark outlived its expiry. Ask whoever made it to keep or undo the change, as in [How to fix something live in an emergency](#how-to-fix-something-live-in-an-emergency).
 
 ## How to ship during an incident or a freeze
@@ -367,7 +367,7 @@ git rm apps/doc-indexer/qa.yaml
 
 Stopping an app in dev needs no approval when you own it, in qa another owner, and in prod a platform approver as well. If another app lists this one in `talks_to` in that environment, `berth check` fails until that app changes too.
 
-After the merge, the deploy reports the namespace as "on the cluster but no longer in git", and the daily drift report lists it until it is gone. Nothing is deleted automatically. A platform operator deletes the namespace once its data, including any persistent volume claims, is no longer needed. The app's Key Vault secrets and any Control-M folders also stay until someone deletes them. Retiring the whole app means deleting its directory, which needs a platform approver.
+After the merge, the deploy deletes the objects berth made in the namespace, so its pods and jobs stop, and reports it as "on the cluster but no longer in git". The Namespace, its persistent volume claims and anything annotated `berth.contoso.io/keep: "true"` stay, and the daily drift report lists the namespace until it is gone. A platform operator deletes it once its data is no longer needed. Restoring the environment file before then brings the app back on the next deploy, with its volumes. The app's Key Vault secrets and any Control-M folders also stay until someone deletes them. Retiring the whole app means deleting its directory, which needs a platform approver.
 
 ## How to see what a platform change does to every app
 
@@ -454,15 +454,16 @@ These have not been run against a real organisation. Treat each step as a checkl
 3. Create the pipeline `berth-deploy` from `pipelines/main.yml`, and Azure Pipelines environments `berth-aks-qa`, `berth-aks-prod`, `berth-controlm-dev`, `berth-controlm-qa` and `berth-controlm-prod`. On `berth-aks-qa` and `berth-aks-prod`, add the **Exclusive lock** check: with the pipeline's `lockBehavior: runLatest`, a newer run then replaces a queued older one, and two deploys never run at once. Add business-hours checks on the prod environments if you want them.
 4. Create variable groups `berth-controlm-dev`, `berth-controlm-qa` and `berth-controlm-prod`, each holding `CTM_ENDPOINT` and a `CTM_TOKEN` issued by the Control-M team. Airflow needs nothing here: point each environment's Git DAG bundle at the `rendered` branch, subdirectory `airflow/<env>/`, with Airflow's own git connection.
 5. If you add a cluster or an environment, add it to `pipelines/templates/targets.yml` too. `berth check` fails until the two agree.
-6. Create a variable group `berth-drift`, linked to Key Vault, holding `SLACK_WEBHOOK_URL`: an incoming webhook for the channel that should get the report.
-7. Create the pipeline `berth-drift` from `pipelines/drift.yml`. It runs at 13:00 UTC every day.
-8. For the rightsizing bot:
+6. Deploys delete what git no longer renders. If a run stops at the prune brake, read the kinds it names. When the change really drops them, run the pipeline again with **Delete past the prune brake** ticked; to deploy everything else first, tick **Keep objects git no longer renders** instead.
+7. Create a variable group `berth-drift`, linked to Key Vault, holding `SLACK_WEBHOOK_URL`: an incoming webhook for the channel that should get the report.
+8. Create the pipeline `berth-drift` from `pipelines/drift.yml`. It runs at 13:00 UTC every day.
+9. For the rightsizing bot:
    1. Check the Datadog metric names in `platform.yaml`'s `rightsizing` against your account first: run `berth rightsize` for one app, as in [How to respond to a rightsizing pull request](#how-to-respond-to-a-rightsizing-pull-request), and compare its numbers with Datadog's own graphs. With wrong names it proposes nothing; with names that measure something else it proposes wrong sizes, which merge by themselves in dev and qa.
    2. Create a variable group `berth-datadog`, linked to Key Vault, holding `DD_API_KEY`, `DD_APP_KEY` and `DD_SITE`.
    3. Create an Azure Resource Manager service connection `berth-rightsizing`, with workload identity federation, for the bot's own identity. Give that identity **Contribute**, **Force push**, **Create branch** and **Contribute to pull requests** on the repository, and set `rightsizing_bot` in `platform.yaml` to its unique name, as it appears in a pull request's `createdBy.uniqueName`. The pipeline signs in as it and passes its token to `berth pr`, so its pull requests are the bot's, never the build service's.
    4. Create the pipeline `berth-rightsize` from `pipelines/rightsize.yml`. It runs every Monday at 12:00 UTC.
-9. For the mirror bot, use the release bot's connection `berth-release`, which the app release template also uses. Create it as in step 8.3 for the release bot's identity, `release_bot` in `platform.yaml`, and also give that identity `AcrPush` on the registry. Then create the pipeline `berth-mirror` from `pipelines/mirror.yml`, which runs every day at 06:00 UTC. Public upstream registries need no credentials.
-10. Grant each variable group pipeline permission to the pipeline that uses it only.
+10. For the mirror bot, use the release bot's connection `berth-release`, which the app release template also uses. Create it as in step 9.3 for the release bot's identity, `release_bot` in `platform.yaml`, and also give that identity `AcrPush` on the registry. Then create the pipeline `berth-mirror` from `pipelines/mirror.yml`, which runs every day at 06:00 UTC. Public upstream registries need no credentials.
+11. Grant each variable group pipeline permission to the pipeline that uses it only.
 
 ## How to set up the gate in Azure DevOps
 

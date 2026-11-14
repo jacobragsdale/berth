@@ -16,6 +16,7 @@ from berth.drift import (
     hand_changes,
     missing,
     object_diff,
+    prune_brake,
     prune_plan,
     reclaims_replicas,
     removal_patch,
@@ -26,6 +27,7 @@ from berth.drift import (
     unmanaged,
 )
 from berth.kube import ManagedFields, ObjectRef, rollout_state
+from berth.model import Limit
 from berth.operate import DeployOptions, Outcome, Results, Seen, State, Target, decide
 
 NOW = datetime(2026, 11, 9, 14, tzinfo=UTC)
@@ -146,6 +148,27 @@ def test_break_glass_round_trips_and_expires() -> None:
     assert BreakGlass.from_data(mark.data()) == mark
     assert mark.active(NOW)
     assert not mark.active(NOW + timedelta(hours=3))
+
+
+LIMIT = Limit(share=0.05, floor=20)
+
+
+def _planned(count: int, kind: str = "CronJob") -> dict[str, list[ObjectRef]]:
+    return {f"app{i}-dev": [ref(kind, f"app{i}-cleanup", namespace=f"app{i}-dev")] for i in range(count)}
+
+
+@pytest.mark.parametrize(("count", "whole", "brakes"), [(20, 100, False), (21, 100, True), (50, 1000, False), (51, 1000, True), (0, 0, False)])
+def test_a_run_that_would_delete_a_large_share_of_a_cluster_deletes_nothing(count: int, whole: int, brakes: bool) -> None:  # noqa: FBT001 - parametrized expectation
+    assert bool(prune_brake(_planned(count), whole, LIMIT)) is brakes
+
+
+def test_the_prune_brake_says_which_kinds_would_go_and_how_to_proceed() -> None:
+    lines = prune_brake(_planned(30) | {"ledger-dev": [ref("NetworkPolicy", "a"), ref("NetworkPolicy", "b")]}, 300, LIMIT)
+    assert lines[0].startswith("prune brake: this run would delete 32 of the 300 objects berth made in app namespaces")
+    assert "  CronJob: 30 in 30 namespaces" in lines
+    assert "  NetworkPolicy: 2 in 1 namespace" in lines
+    assert "--prune-all" in lines[-1]
+    assert "--no-prune" in lines[-1]
 
 
 @pytest.mark.parametrize("data", [{}, {"by": "x"}, {"until": "2026-11-09T14:00:00"}, {"until": "soon"}])  # the third has no time zone

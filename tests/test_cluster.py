@@ -253,7 +253,7 @@ def test_an_object_deleted_by_hand_is_reported_missing(cluster: Cluster) -> None
     assert "ledger-qa" not in cluster.drift()
 
 
-def test_prune_deletes_what_git_dropped_but_never_volumes(cluster: Cluster) -> None:
+def test_a_deploy_deletes_what_git_dropped_but_never_volumes_unless_told_to_keep_it(cluster: Cluster) -> None:
     batch, indexer = cluster.repo / "apps/risk-batch/app.yaml", cluster.repo / "apps/doc-indexer/app.yaml"
     originals = batch.read_text(), indexer.read_text()
     try:
@@ -261,19 +261,52 @@ def test_prune_deletes_what_git_dropped_but_never_volumes(cluster: Cluster) -> N
         batch.write_text(originals[0].replace(cleanup, ""))
         indexer.write_text(originals[1].replace("    volumes:\n      index: {path: /var/lib/indexer, size_gi: 20}\n", ""))
         cluster.commit("no cleanup job; no index volume")
-        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")
+        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software", "--no-prune")
         assert code == 0, out
-        assert "risk-batch-dev: CronJob/risk-batch-cleanup is no longer in git; deploy with --prune to delete it" in out
+        assert "risk-batch-dev: kept CronJob/risk-batch-cleanup, which git no longer renders (--no-prune)" in out
         assert "CronJob/risk-batch-cleanup (removed from git)" in cluster.drift()
-        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software", "--all", "--prune")
+        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software", "--all")
         assert code == 0, out
         assert "risk-batch-dev: deleted CronJob/risk-batch-cleanup" in out
+        assert cluster.kubectl("get", "cronjob", "risk-batch-cleanup", "-n", "risk-batch-qa").returncode != 0
         assert cluster.kubectl("get", "pvc", "doc-indexer-worker-index", "-n", "doc-indexer-dev").returncode == 0  # data is never pruned
+        assert "removed from git" not in cluster.drift()
     finally:
         batch.write_text(originals[0])
         indexer.write_text(originals[1])
         cluster.commit("restore")
         assert cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")[0] == 0
+
+
+def test_a_retired_environment_stops_its_workloads_and_a_large_deletion_waits_for_prune_all(cluster: Cluster) -> None:
+    platform, retired = cluster.repo / "platform/platform.yaml", cluster.repo / "apps/doc-indexer/qa.yaml"
+    originals = platform.read_text(), retired.read_text()
+    try:
+        # With a tight limit, retiring one app environment is more than a deploy may delete on its own.
+        platform.write_text(originals[0] + "deploys:\n  prune_limit: {share: 0.01, floor: 0}\n")
+        retired.unlink()
+        cluster.commit("doc-indexer leaves qa")
+        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")
+        assert code == 1, out  # the platform step failed, so nothing was applied
+        assert "prune brake: this run would delete" in out
+        assert "  Deployment: 1 in 1 namespace" in out
+        assert cluster.kubectl("get", "deployment", "doc-indexer-worker", "-n", "doc-indexer-qa").returncode == 0
+
+        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software", "--prune-all")
+        assert code == 0, out
+        assert "doc-indexer-qa: on the cluster but no longer in git; deleted" in out
+        assert cluster.kubectl("get", "deployment", "doc-indexer-worker", "-n", "doc-indexer-qa").returncode != 0
+        # What a person must decide stays: the Namespace and the volume claim.
+        assert cluster.kubectl("get", "namespace", "doc-indexer-qa").returncode == 0
+        assert cluster.kubectl("get", "pvc", "doc-indexer-worker-index", "-n", "doc-indexer-qa").returncode == 0
+        assert "doc-indexer-qa: on the cluster but no longer in git" in cluster.drift()
+    finally:
+        platform.write_text(originals[0])
+        retired.write_text(originals[1])
+        _git(cluster.repo, "add", ".")
+        cluster.commit("restore")
+        assert cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")[0] == 0
+    assert "doc-indexer-qa" not in cluster.drift()
 
 
 def _config_maps(cluster: Cluster, namespace: str) -> dict[str, dict[str, str]]:

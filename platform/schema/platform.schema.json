@@ -83,6 +83,21 @@
       "title": "ControlMTarget",
       "type": "object"
     },
+    "Deploys": {
+      "additionalProperties": false,
+      "description": "Brakes on what one `berth deploy` may do to a cluster without a person deciding.",
+      "properties": {
+        "prune_limit": {
+          "$ref": "#/$defs/Limit",
+          "default": {
+            "share": 0.05,
+            "floor": 20
+          }
+        }
+      },
+      "title": "Deploys",
+      "type": "object"
+    },
     "Environment": {
       "additionalProperties": false,
       "properties": {
@@ -221,6 +236,29 @@
         "controller"
       ],
       "title": "Gateway",
+      "type": "object"
+    },
+    "Limit": {
+      "additionalProperties": false,
+      "description": "A share of a whole, with a floor for small wholes: exceeded by more than `floor` items and more than `share` of the whole.",
+      "properties": {
+        "share": {
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "title": "Share",
+          "type": "number"
+        },
+        "floor": {
+          "minimum": 0,
+          "title": "Floor",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "share",
+        "floor"
+      ],
+      "title": "Limit",
       "type": "object"
     },
     "Proxy": {
@@ -469,6 +507,9 @@
       },
       "title": "Freezes",
       "type": "array"
+    },
+    "deploys": {
+      "$ref": "#/$defs/Deploys"
     }
   },
   "required": [

@@ -11,12 +11,14 @@ For every app namespace the report says:
 
 import difflib
 import json
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from berth import yamlio
 from berth.kube import FIELD_MANAGER, STAMP_MANAGER, ObjectRef
+from berth.model import Limit
 from berth.render.k8s import KEEP, VERSIONED
 from berth.render.pod import GROUP, MANAGED
 
@@ -121,6 +123,25 @@ def prune_plan(rendered: Iterable[Mapping[str, object]], live: Iterable[ObjectRe
         ),
         key=lambda ref: (ref.kind, ref.name),
     )
+
+
+def prune_brake(planned: Mapping[str, Sequence[ObjectRef]], whole: int, limit: Limit) -> list[str]:
+    """Why a run must delete nothing, or nothing when it may delete what it planned.
+
+    `planned` is what the run would delete, by namespace; `whole` is how many objects berth made in the cluster's app
+    namespaces. Rendering is all or nothing, so a spec that fails to load never empties a namespace. What is left is
+    a renderer change that drops a kind for every app, which looks like a large share of the cluster at once.
+    """
+    count = sum(len(items) for items in planned.values())
+    if not limit.exceeded(count, whole):
+        return []
+    kinds = Counter(item.kind for items in planned.values() for item in items)
+    spread = Counter(item.kind for items in planned.values() for item in {ref.kind: ref for ref in items}.values())
+    allowed = f"more than platform.yaml deploys.prune_limit allows ({limit.floor}, or {limit.share:.0%})"
+    lines = [f"prune brake: this run would delete {count} of the {whole} objects berth made in app namespaces, {allowed}, so it deleted nothing and deployed nothing:"]
+    lines += [f"  {kind}: {number} in {spread[kind]} namespace{'' if spread[kind] == 1 else 's'}" for kind, number in sorted(kinds.items())]
+    lines.append("  if git really dropped them, deploy with --prune-all; to deploy without deleting anything, deploy with --no-prune")
+    return lines
 
 
 @dataclass(frozen=True)

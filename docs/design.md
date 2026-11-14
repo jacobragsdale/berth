@@ -31,7 +31,7 @@ Working back from that problem, any replacement has to keep these properties:
 6. Promotion moves the same artifact forward, and production only receives what already ran in qa.
 7. One app's mistake can neither block nor break another app.
 8. A fleet-wide change is cheap to make and its blast radius is visible before it merges.
-9. Nothing that holds data is deleted because a file went missing.
+9. Nothing that holds data is deleted because a file went missing, and a deploy never deletes much at once without a person.
 10. An emergency has a fast path that is still recorded and reconciled afterwards.
 11. Day-to-day changes, including a new app, never wait on cloud engineering. Whatever does need them is a one-time setup.
 12. A new developer can learn what an app is, and what a change to it will do, from the repository alone.
@@ -110,7 +110,11 @@ Every apply is server-side apply with the field manager `berth`. The API server 
 - **A change made by hand is visible.** Kubernetes notes the manager of every field. A field set by `kubectl-edit`, `kubectl-set` or `kubectl-scale` belongs to someone other than berth or Kubernetes' own controllers. `berth drift` reports each one with the exact path, such as `Deployment/ledger-api: kubectl-set: .spec.template.spec.containers[name=main].env[name=LOG_LEVEL]`.
 - **A deploy never silently undoes one.** If git sets a field that someone changed by hand, the apply stops with a conflict naming the field, and only that app environment's deploy fails. Fields someone added are kept and reported.
 - **Putting git back is explicit.** `berth deploy --revert` takes the conflicting fields back, and removes added fields with a patch built from the same record.
-- **Removing what git dropped is explicit too.** Every object berth makes is labelled. A deploy lists the objects git no longer has, and deletes them only with `--prune`, which the deploy pipeline offers as a parameter. Namespaces, volume claims, and anything else marked `berth.contoso.io/keep` are never deleted. Google's Prodspec paper names partial output as the most common configuration failure, and warns against deleting things because they are absent ([Prodspec](https://www.usenix.org/publications/loginonline/prodspec-and-annealing-intent-based-actuation-google-production)). The one exception is settings: each change renders a new ConfigMap named by its content hash, and a deploy deletes the old one a week after it stopped being rendered, once no workload names it. Without that, every settings change would leave an object behind, and the drift report would fill with them. The other is an autoscaler: when a service goes back to a fixed number of replicas, its deploy deletes the HorizontalPodAutoscaler, which would otherwise go on overriding the count git now sets.
+- **What git dropped is deleted, except what holds data.** Every object berth makes is labelled. A deploy deletes the objects git no longer renders in the namespaces it deploys, so a removed CronJob stops firing and a service made internal loses its HTTPRoute in the same run. An app environment whose file is gone has its workloads stopped the same way. Namespaces, volume claims and anything marked `berth.contoso.io/keep` are never deleted: a person deletes those once nobody needs the data. `--no-prune`, a parameter of the deploy pipeline, holds every deletion for a run.
+
+  Google's Prodspec paper names partial output as the most common configuration failure, and warns against deleting things because they are absent ([Prodspec](https://www.usenix.org/publications/loginonline/prodspec-and-annealing-intent-based-actuation-google-production)). That warning is why data-bearing kinds are never pruned. It is also why pruning the rest is safe here: berth renders all or nothing. A spec that fails to load or render fails `berth check` and stops the deploy before anything is applied, so a missing file cannot quietly empty a namespace. What remains is a renderer change that drops a kind for every app. A brake catches that: a run that would delete more than `deploys.prune_limit` of the cluster's app objects (by default 20, or 5% if that is more) deletes nothing, applies nothing, and fails as the platform would, naming the kinds it would have deleted. If git really dropped them, `--prune-all` goes past the brake.
+
+  Settings are retired on a schedule instead: each change renders a new ConfigMap named by its content hash, and a deploy deletes the old one a week after it stopped being rendered, once no workload names it, so a job that started on the old settings still finds them. An autoscaler git dropped is deleted before the Deployment is applied rather than after, so that between the two it cannot override the count git now sets.
 
 Each app namespace converges on its own, so one app cannot hold up another:
 
@@ -293,7 +297,7 @@ Verified locally:
 
 - rendering, review, the CLI and `berth explain`;
 - schema validation of every rendered object, for Kubernetes 1.33 and 1.34;
-- `berth deploy`, `drift`, `breakglass`, `--revert` and `--prune` against a real kube-apiserver and etcd (envtest 1.34), through `kubectl proxy`, including holds, parallel deploys, retiring old ConfigMaps, and what the break-glass role allows, by impersonating a member of its group;
+- `berth deploy`, `drift`, `breakglass` and `--revert` against a real kube-apiserver and etcd (envtest 1.34), through `kubectl proxy`, including holds, parallel deploys, pruning and its brake, stopping a retired environment, retiring old ConfigMaps, and what the break-glass role allows, by impersonating a member of its group;
 - `berth publish` against a local git remote;
 - every admission policy refusing what it should, and admitting every pod Airflow and Control-M start in dev and qa;
 - both platform software charts, rendered with their values and schema-checked;
