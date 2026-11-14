@@ -82,7 +82,7 @@ strict-equality-semantics = true  # Do not narrow from ==, in, or match value pa
 error-on-warning = true
 
 [tool.pytest.ini_options]
-addopts = "-ra --strict-markers --strict-config --import-mode=importlib -m 'not integration'"
+addopts = "-ra --strict-markers --strict-config --import-mode=importlib -m 'not integration and not scale'"
 testpaths = ["tests"]
 pythonpath = ["tests"]  # for tests/support.py, the shared spec builders; test modules themselves stay unimportable
 xfail_strict = true  # An xfail that starts passing is a failure, not a silent pass.
@@ -92,7 +92,8 @@ filterwarnings = [
     # deprecations you do not control. Never widen this back to "default".
 ]
 markers = [
-    "integration: needs a real database, container, or network; excluded from the default run",
+    "integration: needs the envtest API server or network; excluded from the default run",
+    "scale: times berth on a few hundred synthetic apps against the envtest API server; slow, run on its own",
 ]
 # asyncio_mode = "auto"  # Uncomment in repositories with async code (needs pytest-asyncio).
 

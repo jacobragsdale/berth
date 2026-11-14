@@ -223,10 +223,17 @@ class Site:
     api: ApiServer
     tools: Tools
     cluster: str
+    # Parsing a namespace's manifests takes about 10 ms, and a deploy or drift check reads most of them more than once.
+    _parsed: dict[str, list[dict[str, object]]] = field(default_factory=dict, compare=False, repr=False)
 
     def docs(self, path: str) -> list[dict[str, object]]:
-        text = self.files.get(path)
-        return [] if text is None else [{str(k): v for k, v in doc.items()} for doc in yamlio.load_all(text, source=path) if isinstance(doc, dict)]
+        """The rendered objects in one file of the tree. Callers must not change them: they are parsed once per run."""
+        parsed = self._parsed.get(path)
+        if parsed is None:
+            text = self.files.get(path)
+            parsed = [] if text is None else [{str(k): v for k, v in doc.items()} for doc in yamlio.load_all(text, source=path) if isinstance(doc, dict)]
+            self._parsed[path] = parsed
+        return list(parsed)
 
     def rendered(self, target: Target) -> list[dict[str, object]]:
         return self.docs(target.path)

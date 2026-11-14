@@ -5,96 +5,37 @@ from the platform software charts. The API server stores and admits objects; not
 waited for (`--no-wait`).
 """
 
-import io
 import json
-import os
 import shutil
 import subprocess
 import threading
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from apiserver import BIN, TOKEN, apiserver
+from apiserver import BIN, NOW, TOKEN, Cluster, git, started
 from support import REPO
 
-from berth import gitio, kube, operate
-from berth.cli import parse, run
-from berth.fleet import load
-from berth.kube import helm_template
+from berth import kube, operate
 from berth.operate import Plan, Results, State
-from berth.render.software import releases, template_args, values
 
 pytestmark = pytest.mark.integration
-NOW = datetime(2026, 11, 9, 14, tzinfo=UTC)
 DEVELOPERS = "77777777-7777-7777-7777-777777777777"  # dev's break-glass group in platform.yaml
-
-
-@dataclass(frozen=True)
-class Cluster:
-    repo: Path
-    kubeconfig: Path
-
-    def berth(self, *argv: str, now: datetime = NOW, kubeconfig: Path | None = None) -> tuple[int, str]:
-        out = io.StringIO()
-        connection = ["--kubeconfig", str(kubeconfig or self.kubeconfig)] if argv[0] in {"deploy", "drift", "breakglass"} else []
-        code = run(parse(["--root", str(self.repo), *argv, *connection]), out, now)
-        return code, out.getvalue()
-
-    def kubectl(self, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([str(BIN / "kubectl"), f"--kubeconfig={self.kubeconfig}", "--context", "aks-qa", *args], input=stdin, capture_output=True, text=True, check=False)
-
-    def drift(self) -> str:
-        code, out = self.berth("drift", "--cluster", "aks-qa")
-        assert code == 0, out
-        return out
-
-    def commit(self, message: str) -> None:
-        _git(self.repo, "commit", "-qam", message)
-
-
-def _git(root: Path, *args: str) -> None:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    subprocess.run(["git", "-C", str(root), "-c", "user.name=Test", "-c", "user.email=test@contoso.com", *args], check=True, capture_output=True, env=env)  # noqa: S607
-
-
-def _crds(repo: Path) -> str:
-    """The CRDs platform software brings (External Secrets, Gateway API), without running its controllers."""
-    fleet = load(gitio.worktree(repo))
-    docs: list[str] = []
-    for release in releases(fleet.software, "aks-qa"):
-        rendered = helm_template(str(BIN / "helm"), template_args(release, "1.34.1"), values(release, fleet.platform))
-        docs += [doc for doc in rendered.split("\n---") if "kind: CustomResourceDefinition" in doc]
-    return "\n---".join(docs)
 
 
 @pytest.fixture(scope="module")
 def cluster(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Cluster]:
-    if not (BIN / "kube-apiserver").exists():
-        pytest.fail("run scripts/fetch-tools.sh first")
     work = tmp_path_factory.mktemp("cluster")
     repo = work / "repo"
     for part in ("platform", "apps"):
         shutil.copytree(REPO / part, repo / part)
     shutil.copy(REPO / ".gitignore", repo / ".gitignore")
-    with pytest.MonkeyPatch.context() as env:
-        env.setenv("BERTH_KUBECTL", str(BIN / "kubectl"))
-        env.setenv("BERTH_HELM", str(BIN / "helm"))
-        for name in ("CACHE", "CONFIG", "DATA"):
-            env.setenv(f"HELM_{name}_HOME", str(REPO / ".tools" / "helm" / name.lower()))
-        _git(repo, "init", "-q", "-b", "main")
-        _git(repo, "add", ".")
-        _git(repo, "commit", "-q", "-m", "base")
-        with apiserver(work / "api") as kubeconfig:
-            here = Cluster(repo, kubeconfig)
-            assert here.kubectl("apply", "--server-side", "-f", "-", stdin=_crds(repo)).returncode == 0
-            assert here.kubectl("wait", "--for=condition=Established", "crd", "--all", "--timeout=60s").returncode == 0
-            code, out = here.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")
-            assert code == 0, out
-            yield here
+    with started(repo, work) as here:
+        code, out = here.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")
+        assert code == 0, out
+        yield here
 
 
 def test_a_fresh_deploy_leaves_every_app_namespace_in_sync_and_stamped(cluster: Cluster) -> None:
@@ -201,7 +142,7 @@ def test_a_failure_holds_that_app_in_the_next_environment_and_no_other_app(clust
         assert "1 deployed" in out  # only qa was left to do
     finally:
         app.write_text(original)
-        _git(cluster.repo, "checkout", "-q", "HEAD~1", "--", "apps/ledger/qa.yaml")
+        git(cluster.repo, "checkout", "-q", "HEAD~1", "--", "apps/ledger/qa.yaml")
         cluster.commit("restore")
         assert cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")[0] == 0
 
@@ -436,7 +377,7 @@ def test_a_retired_environment_stops_its_workloads_and_a_large_deletion_waits_fo
     finally:
         platform.write_text(originals[0])
         retired.write_text(originals[1])
-        _git(cluster.repo, "add", ".")
+        git(cluster.repo, "add", ".")
         cluster.commit("restore")
         assert cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")[0] == 0
     assert "doc-indexer-qa" not in cluster.drift()
