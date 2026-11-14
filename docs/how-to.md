@@ -102,7 +102,7 @@ uv run berth promote ledger --to prod
 apps/ledger/prod.yaml: version 3.1.0@sha256:d8fdf1a9…
 ```
 
-A qa promotion needs no approval when you own the app. A prod promotion needs another owner. In both cases the version must already appear in the source environment's file somewhere in `main`'s history: `dev.yaml` for qa, `qa.yaml` for prod. If it does not, the gate also requires a platform approver and says so (`3.1.0 has not run in qa`). berth reads git history, not the cluster, so "has run" means "was merged to main", not that the deploy succeeded or passed tests.
+A qa promotion needs no approval when you own the app. A prod promotion needs another owner. In both cases the version must already appear in the source environment's file somewhere in `main`'s history: `dev.yaml` for qa, `qa.yaml` for prod. If it does not, the gate also requires a platform approver and says so (`3.1.0 has not run in qa`). The gate reads git history, not the cluster, so there "has run" means "was merged to main". The deploy adds the rest: it holds an app's prod environment while its qa environment failed, was held, or was skipped for break-glass, and holds an environment deployed on its own (`--app ledger --env prod`) unless the one it promotes from already runs what git renders for it, when both are on one cluster. A held environment deploys on the next run after its source has.
 
 You can promote to qa and prod in one pull request by running `promote` twice, qa first. The prod change then needs a platform approver, because the version is not yet in `qa.yaml` on `main`. Promoting in two pull requests avoids that.
 

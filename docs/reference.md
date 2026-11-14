@@ -273,7 +273,7 @@ berth talks to the API server through `kubectl proxy`, on a Unix socket in a dir
 | Outcome | When |
 |---|---|
 | `unchanged` | The namespace's `berth.contoso.io/deployed-digest` equals the digest of what git renders for it, and neither `--all` nor `--revert` was given. Nothing is applied. |
-| `held` | The environment it promotes from failed or was held for the same app in this run, on this cluster or in a `--hold-from` results file. Nothing is applied. |
+| `held` | The environment it promotes from failed, was held, or was skipped for break-glass, for the same app in this run, on this cluster or in a `--hold-from` results file. Or that environment is on this cluster, is not part of this run (as with `--app APP --env prod`), and its namespace's `deployed-digest` is not what git renders for it. Nothing is applied; the detail says which. |
 | `skipped` | A `berth-break-glass` ConfigMap in the namespace has an expiry in the future (unless `--include-break-glass`), or the namespace's `berth.contoso.io/deployed-commit` descends from the commit being deployed. |
 
 Before applying anything, a deploy works out what it would delete: the objects git dropped from each namespace it may deploy, and what berth made in each retired environment. If that exceeds `deploys.prune_limit`, it stops there; see [Deploy brakes](#deploy-brakes).

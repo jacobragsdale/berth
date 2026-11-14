@@ -179,6 +179,33 @@ def test_a_failure_holds_that_app_in_the_next_environment_and_no_other_app(clust
         assert cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")[0] == 0
 
 
+def test_qa_waits_for_a_version_dev_did_not_run_because_of_break_glass_or_a_deploy_of_qa_alone(cluster: Cluster) -> None:
+    app = cluster.repo / "apps/ledger/app.yaml"
+    original = app.read_text()
+    assert cluster.berth("breakglass", "ledger", "--env", "dev", "--reason", "debugging the ledger in dev")[0] == 0
+    try:
+        app.write_text(original.replace("LOG_LEVEL: info", "LOG_LEVEL: debug"))  # reaches dev and qa
+        cluster.commit("ledger logs at debug")
+        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")
+        assert code == 2, out
+        assert "ledger-dev: skipped: break-glass by berth-test-admin" in out
+        assert "ledger-qa: held: ledger was skipped for break-glass in dev, and qa promotes from dev" in out
+
+        assert cluster.berth("breakglass", "ledger", "--env", "dev", "--end")[0] == 0
+        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "ledger", "--env", "qa")
+        assert code == 2, out
+        assert "ledger-qa: held: ledger-dev does not run what git renders for it and is not deployed in this run" in out
+
+        code, out = cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--app", "ledger")
+        assert code == 0, out
+        assert "2 deployed" in out
+    finally:
+        cluster.berth("breakglass", "ledger", "--env", "dev", "--end")
+        app.write_text(original)
+        cluster.commit("restore")
+        assert cluster.berth("deploy", "--cluster", "aks-qa", "--no-wait", "--no-software")[0] == 0
+
+
 def test_a_change_adopted_into_the_spec_deploys_cleanly_and_stops_being_drift(cluster: Cluster) -> None:
     env_file = cluster.repo / "apps/ledger/qa.yaml"
     original = env_file.read_text()

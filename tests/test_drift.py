@@ -232,6 +232,29 @@ def test_an_environment_is_held_while_the_one_it_promotes_from_failed(source: St
     assert _decided(_target("prod"), _seen("prod"), {("other", "qa"): Outcome(app="other", env="qa", state=State.FAILED)}) is None  # another app never holds this one
 
 
+def test_prod_is_held_while_qa_is_skipped_for_break_glass_but_not_for_a_newer_commit() -> None:
+    glass = Outcome(app="demo", env="qa", state=State.SKIPPED, detail="break-glass by alice", break_glass=True)
+    held = decide(_target("prod"), _seen("prod"), {("demo", "qa"): glass}, FLEET, OPTIONS)
+    assert held is not None
+    assert held.state is State.HELD
+    assert held.detail == "demo was skipped for break-glass in qa, and prod promotes from qa"
+    newer = Outcome(app="demo", env="qa", state=State.SKIPPED, detail="a newer commit is already deployed here")
+    assert _decided(_target("prod"), _seen("prod"), {("demo", "qa"): newer}) is None
+
+
+def test_an_environment_deployed_on_its_own_is_held_unless_its_source_runs_what_git_renders() -> None:
+    target = replace(_target("qa"), source="demo-dev", source_digest="dev-now")
+    both = Seen({**_seen("qa").namespaces, **_seen("dev", "dev-now").namespaces}, {}, {})
+    assert _decided(target, both) is None  # dev runs what git renders for it
+    stale = Seen({**_seen("qa").namespaces, **_seen("dev", "dev-before").namespaces}, {}, {})
+    held = decide(target, stale, {}, FLEET, OPTIONS)
+    assert held is not None
+    assert held.state is State.HELD
+    assert held.detail == "demo-dev does not run what git renders for it and is not deployed in this run, and qa promotes from dev"
+    assert _decided(target, _seen("qa")) is State.HELD  # dev was never deployed
+    assert _decided(target, stale, {("demo", "dev"): Outcome(app="demo", env="dev", state=State.DEPLOYED)}) is None  # this run deployed it
+
+
 def test_break_glass_and_newer_commits_are_skipped() -> None:
     mark = BreakGlass(by="alice", reason="incident", until=NOW + timedelta(hours=1))
     assert _decided(_target("dev"), _seen("dev", mark=mark)) is State.SKIPPED

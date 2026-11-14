@@ -61,6 +61,7 @@ class Outcome(_Model):
     env: str
     state: State
     detail: str = ""
+    break_glass: bool = False  # skipped because someone broke glass there, so it may not run what git renders
 
 
 class Results(_Model):
@@ -91,6 +92,8 @@ class Target:
     path: str  # its manifests in the rendered tree
     digest: str
     configmaps: frozenset[str] = frozenset()  # the versioned ConfigMaps it renders, by name
+    source: str | None = None  # the namespace of the environment it promotes from, when that is on the same cluster
+    source_digest: str = ""  # and the digest of what git renders there
 
 
 def digest(text: str) -> str:
@@ -100,12 +103,16 @@ def digest(text: str) -> str:
 def targets(fleet: Fleet, cluster: str, files: Mapping[str, str]) -> list[Target]:
     """The app namespaces on one cluster, in promotion order (dev, qa, prod), then by app."""
     order = fleet.platform.promotion_order()
-    found = [
-        Target(instance.app, instance.env, instance.namespace, path, digest(files[path]), _configmaps(fleet, instance))
+    found = {
+        (instance.app, instance.env): Target(instance.app, instance.env, instance.namespace, path, digest(files[path]), _configmaps(fleet, instance))
         for instance in fleet.instances()
         if fleet.platform.environments[instance.env].cluster == cluster and (path := manifests_path(cluster, instance.namespace)) in files
-    ]
-    return sorted(found, key=lambda target: (order.index(target.env), target.app))
+    }
+    for (app, env), target in found.items():
+        source = found.get((app, fleet.platform.environments[env].promotes_from or ""))
+        if source is not None:
+            found[(app, env)] = replace(target, source=source.namespace, source_digest=source.digest)
+    return sorted(found.values(), key=lambda target: (order.index(target.env), target.app))
 
 
 def _configmaps(fleet: Fleet, instance: Instance) -> frozenset[str]:
@@ -168,10 +175,16 @@ def decide(target: Target, seen: Seen, outcomes: Mapping[tuple[str, str], Outcom
         return outcome(State.UNCHANGED)
     source = fleet.platform.environments[target.env].promotes_from
     before = outcomes.get((target.app, source)) if source is not None else None
-    if before is not None and before.state in _STOPPED:
-        return outcome(State.HELD, f"{target.app} {before.state} in {source} in this run, and {target.env} promotes from {source}")
+    if before is not None and (before.state in _STOPPED or before.break_glass):
+        why = f"was skipped for break-glass in {source}" if before.break_glass else f"{before.state} in {source} in this run"
+        return outcome(State.HELD, f"{target.app} {why}, and {target.env} promotes from {source}")
+    if before is None and target.source is not None:
+        # Not part of this run, as with --app X --env prod: what "ran in qa" means is what qa's namespace is stamped with.
+        source_ns = seen.namespaces.get(target.source)
+        if source_ns is None or source_ns.annotations.get(drift.DEPLOYED_DIGEST) != target.source_digest:
+            return outcome(State.HELD, f"{target.source} does not run what git renders for it and is not deployed in this run, and {target.env} promotes from {source}")
     if _breaks_glass(mark, options):
-        return outcome(State.SKIPPED, f"break-glass by {mark.by} until {mark.until:%Y-%m-%d %H:%M %Z} ({mark.reason})")
+        return Outcome(app=target.app, env=target.env, state=State.SKIPPED, detail=f"break-glass by {mark.by} until {mark.until:%Y-%m-%d %H:%M %Z} ({mark.reason})", break_glass=True)
     deployed = annotations.get(drift.DEPLOYED_COMMIT)
     if deployed is not None and deployed != options.commit and options.newer(deployed):
         return outcome(State.SKIPPED, f"a newer commit ({deployed[:_SHORT]}) is already deployed here")
